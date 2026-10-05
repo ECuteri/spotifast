@@ -1376,8 +1376,8 @@ msgid ""
 "Fade the end of a song into the start of the next. Off keeps the handover as "
 "it is."
 msgstr ""
-"Das Ende eines Lieds in den Anfang des nächsten überblenden. Aus lässt den "
-"Übergang unverändert."
+"Das Ende eines Lieds in den Anfang des nächsten überblenden. Wenn die "
+"Überblendung ausgeschaltet ist, bleibt der Übergang unverändert."
 
 #: src/ui/settings.rs:553
 msgid "Reconnect"

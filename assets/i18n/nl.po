@@ -1373,8 +1373,8 @@ msgid ""
 "Fade the end of a song into the start of the next. Off keeps the handover as "
 "it is."
 msgstr ""
-"Laat het einde van een nummer overgaan in het begin van het volgende. Uit "
-"houdt de overgang zoals die is."
+"Laat het einde van een nummer overvloeien in het begin van het volgende. "
+"Als crossfade is uitgeschakeld, blijft de overgang ongewijzigd."
 
 #: src/ui/settings.rs:553
 msgid "Reconnect"

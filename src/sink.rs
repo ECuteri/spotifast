@@ -202,9 +202,12 @@ impl AudioControl {
         })
     }
 
-    /// Frames of one channel the overlap lasts, at Spotify's rate.
-    fn crossfade_frames(&self) -> usize {
-        (self.crossfade.as_secs_f64() * f64::from(SAMPLE_RATE)).ceil() as usize
+    /// Frames of one channel the overlap lasts, at the rate the samples
+    /// have when they are mixed. That is the device rate: resampling has
+    /// already happened, and measuring the window at Spotify's rate would
+    /// stretch or shrink the fade on a device that runs at another one.
+    fn crossfade_frames(&self, sample_rate: u32) -> usize {
+        (self.crossfade.as_secs_f64() * f64::from(sample_rate)).ceil() as usize
     }
 
     /// Follows confirmed decoder transitions, including seeks requested by
@@ -876,7 +879,8 @@ impl Sink for RodioSink {
         if self.control.take_crossing() {
             output.crossing = true;
         }
-        let samples = output.crossfade(samples, self.control.crossfade_frames());
+        let samples =
+            output.crossfade(samples, self.control.crossfade_frames(output.sample_rate));
         let now = Instant::now();
         if output.fed && output.sink.empty() && !output.sink.is_paused() {
             let late_ms = output
