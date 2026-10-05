@@ -694,7 +694,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         &mut seconds,
                         0..=crate::sink::CROSSFADE_MAX.as_secs() as u32,
                         |slider| slider.integer().suffix(suffix.clone()),
-                        |value| value.suffix(suffix),
+                        |value| value.suffix(suffix.clone()),
                     )
                     .changed()
                         && app.settings.crossfade_secs != seconds
@@ -2065,7 +2065,9 @@ fn output_device_picker(
                 }
                 ui.separator();
                 for name in names {
-                    if ui.selectable_label(saved.as_deref() == Some(name.as_str()), &name).clicked()
+                    if ui
+                        .selectable_label(saved.as_deref() == Some(name.as_str()), &name)
+                        .clicked()
                         && saved.as_deref() != Some(name.as_str())
                     {
                         app.settings.audio_device = Some(name);
