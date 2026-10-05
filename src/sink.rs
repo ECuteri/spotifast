@@ -170,6 +170,9 @@ pub struct AudioControl {
     target: Mutex<AudioTarget>,
     waiting_for_track: AtomicBool,
     reset_output: AtomicBool,
+    /// A skip or a seek drops the held crossfade tail. A pause does not
+    /// set this, so the overlap is still there when the song resumes.
+    drop_tail: AtomicBool,
     buffer_ms: u32,
     /// Song-to-song overlap. Zero keeps the ordinary gapless handoff and
     /// holds nothing back.
@@ -197,6 +200,7 @@ impl AudioControl {
             target: Mutex::new(AudioTarget::default()),
             waiting_for_track: AtomicBool::new(false),
             reset_output: AtomicBool::new(false),
+            drop_tail: AtomicBool::new(false),
             buffer_ms: buffer_ms.clamp(*BUFFER_MS_RANGE.start(), *BUFFER_MS_RANGE.end()),
             crossfade: crossfade.min(CROSSFADE_MAX),
         })
@@ -224,6 +228,7 @@ impl AudioControl {
                     sink.stop();
                 }
                 self.reset_output.store(true, Ordering::SeqCst);
+                self.drop_tail.store(true, Ordering::SeqCst);
                 // Previous can rewind the current track after interrupting
                 // it. Release that gate, but never close it for a seek:
                 // the decoder is already sending audio from the new position.
@@ -236,6 +241,9 @@ impl AudioControl {
 
     /// Fades and discards the current output before a user-requested track
     /// change. Repeated skips share the same handoff.
+    ///
+    /// A pause is not this. librespot pauses through `Sink::stop`, which
+    /// keeps the held crossfade tail so Play can resume it.
     pub fn interrupt(&self) {
         if self.waiting_for_track.swap(true, Ordering::SeqCst) {
             return;
@@ -257,6 +265,7 @@ impl AudioControl {
             sink.stop();
         }
         self.reset_output.store(true, Ordering::SeqCst);
+        self.drop_tail.store(true, Ordering::SeqCst);
     }
 
     /// Marks the next audio as the start of a new song, so a crossfade can
@@ -296,6 +305,17 @@ impl AudioControl {
         }
         let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut target.crossing)
+    }
+
+    /// A skip or a seek throws the held tail away. A pause does not: Play
+    /// has to resume the same song, overlap included.
+    fn take_drop_tail(&self) -> bool {
+        self.drop_tail.swap(false, Ordering::SeqCst)
+    }
+
+    /// Whether a crossfade is configured. Zero is the ordinary path.
+    fn crossfade_on(&self) -> bool {
+        !self.crossfade.is_zero()
     }
 
     fn register(&self, sink: &Arc<rodio::Sink>, envelope: Arc<Envelope>) {
@@ -639,9 +659,10 @@ impl Output {
 
     /// Hands the held tail to the output and forgets it.
     ///
-    /// Pause calls this so the end of a song still plays when nothing follows
-    /// it. A song that does follow mixes the tail instead, through
-    /// [`Self::crossfade`].
+    /// The end of a song calls this so the last overlap still plays when
+    /// nothing follows it. A pause does not: that tail has to be there when
+    /// the same song resumes. A song that does follow mixes the tail
+    /// instead, through [`Self::crossfade`].
     fn play_tail(&mut self) {
         if self.tail.is_empty() {
             return;
@@ -806,13 +827,23 @@ impl Sink for RodioSink {
     }
 
     /// Never fails: librespot exits the process when a sink cannot stop.
+    ///
+    /// librespot calls this for a pause as well as for the end of playback,
+    /// so the two have to be told apart. A pause keeps the held crossfade
+    /// tail: the audible fade is the transport envelope, and the overlap
+    /// stays buffered for the resume. Only a skip, a seek, or the song
+    /// ending plays that tail out.
     fn stop(&mut self) -> SinkResult<()> {
         if let Some(output) = &mut self.output {
-            output.play_tail();
+            if self.control.take_drop_tail() || !self.control.crossfade_on() {
+                output.play_tail();
+            }
             // The drain below plays the queue out, so the ramp is cut to
             // what is in it. During steady playback that is the whole
             // 250 ms; just after a seek or a track change it is whatever has
-            // been decoded since.
+            // been decoded since. The held tail is not in this queue, so a
+            // pause does not sit here while up to twelve seconds of overlap
+            // play out in silence.
             output.transport.fade_out_over(output.queued.frames());
             let deadline = Instant::now() + DRAIN_TIMEOUT;
             while !output.sink.empty() && !output.failed() && Instant::now() < deadline {
@@ -825,9 +856,13 @@ impl Sink for RodioSink {
             output.transport.close();
             output.fed = false;
             output.last_write = None;
-            output.tail.clear();
-            output.incoming.clear();
-            output.crossing = false;
+            if self.control.crossfade_on() {
+                output.crossing = false;
+            } else {
+                output.tail.clear();
+                output.incoming.clear();
+                output.crossing = false;
+            }
         }
         Ok(())
     }
@@ -1462,6 +1497,29 @@ mod tests {
         assert_eq!(CROSSFADE_MAX, Duration::from_secs(12));
         assert!(CROSSFADE_DEFAULT > Duration::ZERO);
         assert!(CROSSFADE_DEFAULT < CROSSFADE_MAX);
+    }
+
+    /// librespot pauses through `Sink::stop`, so a pause must not play the
+    /// held overlap out. A skip does: the old song is gone.
+    #[test]
+    fn a_pause_keeps_the_crossfade_tail_and_a_skip_drops_it() {
+        let control = AudioControl::with_crossfade(DEFAULT_BUFFER_MS, CROSSFADE_DEFAULT);
+        assert!(
+            !control.take_drop_tail(),
+            "a pause has not asked to drop it"
+        );
+
+        control.interrupt();
+        assert!(control.take_drop_tail(), "a skip drops the old song's tail");
+        assert!(!control.take_drop_tail(), "the mark is read once");
+
+        control.handle_player_event(&PlayerEvent::Seeked {
+            play_request_id: 1,
+            track_id: librespot_core::SpotifyUri::from_uri("spotify:track:14XWXWv5FoCbFzLksawpEe")
+                .unwrap(),
+            position_ms: 0,
+        });
+        assert!(control.take_drop_tail(), "a seek drops it too");
     }
 
     /// Crossfade keeps only the overlap and mixes the next song into it.
