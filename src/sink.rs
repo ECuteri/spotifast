@@ -879,8 +879,7 @@ impl Sink for RodioSink {
         if self.control.take_crossing() {
             output.crossing = true;
         }
-        let samples =
-            output.crossfade(samples, self.control.crossfade_frames(output.sample_rate));
+        let samples = output.crossfade(samples, self.control.crossfade_frames(output.sample_rate));
         let now = Instant::now();
         if output.fed && output.sink.empty() && !output.sink.is_paused() {
             let late_ms = output
