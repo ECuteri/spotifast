@@ -62,7 +62,9 @@ Selected rows have a translucent neutral highlight. Keyboard focus uses
 the row highlight without an extra outline.
 
 Dragging an unselected row copies just that song. Reordering within a
-playlist still moves one song at a time.
+playlist still moves one song at a time. Several selected songs dropped back
+between the rows of their own open playlist stay where they are. Dropped on
+that playlist in the sidebar, they ask before being added again.
 
 ## Copying and pasting songs
 
@@ -191,6 +193,14 @@ down to extend or shrink the selection from its anchor. Press `Delete` to
 remove selected songs from a playlist you can edit, just like **Remove from
 this playlist**. On macOS, both `Delete` and `Fn+Delete` work. Text fields,
 dialogs and open menus keep Delete from acting on the list.
+
+Press and hold the player bar's volume slider to update local volume without
+moving the pointer. Remote volume is sent on release. The seek slider previews
+on press and seeks on release.
+
+The default local output smooths volume and mute changes over 30 ms. Explicit
+track changes and play/pause/stop use nominal 50 ms fades. Stopping can shorten
+the fade to the queued audio. Natural track transitions remain gapless.
 
 Left and right arrows adjust a focused volume slider by five percentage
 points, or the seek slider by one percent of the song. Screen readers can
