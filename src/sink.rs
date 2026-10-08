@@ -100,6 +100,16 @@ impl Crossfade {
         )
     }
 
+    /// Frames of the current song that have not reached the output yet.
+    /// During a fade the remaining outgoing frames belong to the old song.
+    pub(crate) fn pending_frames(&self) -> usize {
+        let outgoing = self
+            .progress
+            .as_ref()
+            .map_or(0, |fade| fade.frames - fade.mixed);
+        (self.tail.len() / NUM_CHANNELS as usize).saturating_sub(outgoing)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.tail.clear();
         self.progress = None;
@@ -119,7 +129,7 @@ struct CrossfadeProgress {
 
 /// Holds the last `overlap` frames of a song and mixes the next one into them.
 ///
-/// `overlap` of zero returns `samples` unchanged. While a song plays, each
+/// Zero drains held audio in order and lets an active curve finish. Each
 /// call releases what falls outside the window and keeps the rest. The first
 /// call of a new song (`crossing`) begins mixing the kept tail with the new
 /// start. Subsequent packets continue that mix before holding the new tail.
@@ -130,9 +140,6 @@ fn take_crossfade(
     overlap: usize,
     crossing: bool,
 ) -> Vec<f64> {
-    if overlap == 0 {
-        return samples;
-    }
     let channels = NUM_CHANNELS as usize;
     let keep = overlap * channels;
     let mut output = Vec::with_capacity(samples.len());
@@ -161,6 +168,11 @@ fn take_crossfade(
     }
     // Only audio beyond the current overlap becomes the new song's held tail.
     tail.extend(samples[consumed..].iter().copied());
+    // The outgoing part of an active fade still belongs to its original
+    // curve. A shorter setting must not release those frames a second time.
+    let keep = progress
+        .as_ref()
+        .map_or(keep, |fade| keep.max((fade.frames - fade.mixed) * channels));
     let release = tail.len().saturating_sub(keep);
     output.extend(tail.drain(..release));
     output
@@ -214,6 +226,7 @@ pub struct AudioControl {
     /// Dedicated events, published by the decoder before its sink calls.
     events: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>>>,
     waiting_for_track: AtomicBool,
+    play_request_id: AtomicU64,
     reset_output: AtomicBool,
     /// A skip or a seek drops the held crossfade tail. A pause does not
     /// set this, so the overlap is still there when the song resumes.
@@ -223,11 +236,15 @@ pub struct AudioControl {
     /// A following track, seek, or stop clears it, so a pause still keeps
     /// the tail.
     end_of_track: AtomicBool,
+    finish_output: AtomicBool,
     reset_processing: AtomicBool,
     buffer_ms: u32,
-    /// Song-to-song overlap. Zero keeps the ordinary gapless handoff and
-    /// holds nothing back.
-    crossfade: Duration,
+    /// Song-to-song overlap. Zero follows the saved Gapless choice and
+    /// releases any previously held audio.
+    crossfade_ms: AtomicU32,
+    gapless: AtomicBool,
+    stop_between_tracks: AtomicBool,
+    pub(crate) clock: Arc<PlaybackClock>,
     track_duration_ms: AtomicU32,
 }
 
@@ -252,12 +269,17 @@ impl AudioControl {
             target: Mutex::new(AudioTarget::default()),
             events: Mutex::new(None),
             waiting_for_track: AtomicBool::new(false),
+            play_request_id: AtomicU64::new(u64::MAX),
             reset_output: AtomicBool::new(false),
             drop_tail: AtomicBool::new(false),
             end_of_track: AtomicBool::new(false),
+            finish_output: AtomicBool::new(false),
             reset_processing: AtomicBool::new(false),
             buffer_ms: buffer_ms.clamp(*BUFFER_MS_RANGE.start(), *BUFFER_MS_RANGE.end()),
-            crossfade: crossfade.min(CROSSFADE_MAX),
+            crossfade_ms: AtomicU32::new(crossfade.min(CROSSFADE_MAX).as_millis() as u32),
+            gapless: AtomicBool::new(true),
+            stop_between_tracks: AtomicBool::new(false),
+            clock: Arc::new(PlaybackClock::default()),
             track_duration_ms: AtomicU32::new(0),
         })
     }
@@ -265,13 +287,33 @@ impl AudioControl {
     /// Frames of one channel in the overlap, before backend resampling.
     pub(crate) fn crossfade_frames(&self, sample_rate: u32) -> usize {
         let duration_ms = self.track_duration_ms.load(Ordering::SeqCst);
-        let overlap = if duration_ms == 0 {
-            self.crossfade
+        let configured = self.crossfade_ms.load(Ordering::SeqCst);
+        let overlap = Duration::from_millis(u64::from(if duration_ms == 0 {
+            configured
         } else {
-            self.crossfade
-                .min(Duration::from_millis(u64::from(duration_ms)))
-        };
+            configured.min(duration_ms)
+        }));
         (overlap.as_secs_f64() * f64::from(sample_rate)).ceil() as usize
+    }
+
+    /// The decoder reads this at packet boundaries; no output is restarted.
+    pub(crate) fn set_crossfade(&self, duration: Duration) {
+        self.crossfade_ms.store(
+            duration.min(CROSSFADE_MAX).as_millis() as u32,
+            Ordering::SeqCst,
+        );
+    }
+
+    pub(crate) fn set_gapless(&self, enabled: bool) {
+        self.gapless.store(enabled, Ordering::SeqCst);
+    }
+
+    pub(crate) fn finish_output(&self) {
+        self.finish_output.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn take_boundary_stop(&self) -> bool {
+        self.stop_between_tracks.swap(false, Ordering::SeqCst)
     }
 
     pub(crate) fn follow_events(&self, events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
@@ -296,19 +338,38 @@ impl AudioControl {
     /// Follows confirmed decoder transitions, including seeks requested by
     /// another Spotify client. Natural track changes retain gapless audio.
     pub(crate) fn handle_player_event(&self, event: &PlayerEvent) {
+        if let PlayerEvent::PlayRequestIdChanged { play_request_id } = event {
+            self.play_request_id
+                .store(*play_request_id, Ordering::SeqCst);
+            return;
+        }
+        let current = self.play_request_id.load(Ordering::SeqCst);
+        if current != u64::MAX && event.get_play_request_id().is_some_and(|id| id != current) {
+            return;
+        }
         match event {
             PlayerEvent::TrackChanged { audio_item } => {
                 let natural = self.end_of_track.swap(false, Ordering::SeqCst);
+                self.stop_between_tracks.store(
+                    natural && !self.crossfade_on() && !self.gapless.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                );
                 self.track_duration_ms
                     .store(audio_item.duration_ms, Ordering::SeqCst);
                 if natural {
                     self.note_track_change();
-                } else if self.crossfade_on() {
+                } else {
                     self.interrupt();
                 }
+                self.clock.new_track();
                 self.track_changed();
             }
-            PlayerEvent::Seeked { .. } => {
+            PlayerEvent::Playing { position_ms, .. } | PlayerEvent::Paused { position_ms, .. } => {
+                self.clock.start_at(*position_ms);
+            }
+            PlayerEvent::Seeked { position_ms, .. } => {
+                self.clock.seek(*position_ms);
+                self.stop_between_tracks.store(false, Ordering::SeqCst);
                 self.end_of_track.store(false, Ordering::SeqCst);
                 let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
                 target.crossing = false;
@@ -345,6 +406,7 @@ impl AudioControl {
         if self.waiting_for_track.swap(true, Ordering::SeqCst) {
             return;
         }
+        self.clock.freeze();
         let (sink, envelope) = {
             let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
             target.crossing = false;
@@ -368,10 +430,11 @@ impl AudioControl {
     }
 
     /// Marks the next audio as the start of a new song, so a crossfade can
-    /// mix it with the tail already queued. Does nothing while crossfade is
-    /// off, and a skip still discards that tail through [`Self::interrupt`].
+    /// mix it with the tail already queued. Record the boundary even after
+    /// switch-off so held audio is released. A skip discards that tail
+    /// through [`Self::interrupt`].
     fn note_track_change(&self) {
-        if self.crossfade.is_zero() || self.waiting_for_track.load(Ordering::SeqCst) {
+        if self.waiting_for_track.load(Ordering::SeqCst) {
             return;
         }
         let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
@@ -398,16 +461,13 @@ impl AudioControl {
         !self.waiting_for_track() && self.reset_processing.swap(false, Ordering::SeqCst)
     }
 
-    fn take_reset(&self) -> bool {
+    pub(crate) fn take_reset(&self) -> bool {
         self.reset_output.swap(false, Ordering::SeqCst)
     }
 
     /// Whether the next packet starts a new song that should mix with the
     /// held tail. Reading it clears the mark, so only that packet crosses.
     pub(crate) fn take_crossing(&self) -> bool {
-        if self.crossfade.is_zero() {
-            return false;
-        }
         let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut target.crossing)
     }
@@ -426,7 +486,7 @@ impl AudioControl {
 
     /// Whether a crossfade is configured. Zero is the ordinary path.
     pub(crate) fn crossfade_on(&self) -> bool {
-        !self.crossfade.is_zero()
+        self.crossfade_ms.load(Ordering::SeqCst) != 0
     }
 
     fn register(&self, sink: &Arc<rodio::Sink>, envelope: Arc<Envelope>) {
@@ -436,11 +496,195 @@ impl AudioControl {
     }
 }
 
+/// Position derived from audio submitted to the output minus audio still queued.
+/// Decoder reports remain available to Connect, but never advance this clock.
+#[derive(Debug, Default)]
+pub(crate) struct PlaybackClock {
+    state: Mutex<ClockState>,
+}
+
+impl PartialEq for PlaybackClock {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClockState {
+    track: u64,
+    awaiting_position: bool,
+    seeks: u64,
+    epoch: u64,
+    origin: u64,
+    submitted: u64,
+    pending: u64,
+    frozen: Option<u64>,
+    last_position: u64,
+    output: ClockOutput,
+}
+
+#[derive(Debug, Default)]
+enum ClockOutput {
+    #[default]
+    None,
+    Native {
+        queued: Weak<Queued>,
+        rate: u32,
+        device: fastframe_audio::Clock,
+    },
+    /// PulseAudio reports server and device latency after a blocking write.
+    #[cfg(target_os = "linux")]
+    Latency { frames: u64, at: Instant },
+}
+
+impl ClockState {
+    fn position(&self) -> u64 {
+        if let Some(frozen) = self.frozen {
+            return frozen;
+        }
+        let queued = match &self.output {
+            ClockOutput::None => 0,
+            ClockOutput::Native {
+                queued,
+                rate,
+                device,
+            } => queued.upgrade().map_or(0, |q| {
+                let frames = q.frames();
+                let latency = if frames == 0 {
+                    let last = q
+                        .last_rendered
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    device
+                        .latency()
+                        .saturating_sub(last.map_or(Duration::ZERO, |at| at.elapsed()))
+                } else {
+                    device.latency()
+                };
+                frames * u64::from(SAMPLE_RATE) / u64::from(*rate)
+                    + (latency.as_secs_f64() * f64::from(SAMPLE_RATE)) as u64
+            }),
+            #[cfg(target_os = "linux")]
+            ClockOutput::Latency { frames, at } => {
+                frames.saturating_sub((at.elapsed().as_secs_f64() * f64::from(SAMPLE_RATE)) as u64)
+            }
+        };
+        self.submitted.saturating_sub(queued).max(self.origin)
+    }
+}
+
+impl PlaybackClock {
+    pub(crate) fn position_ms(&self, track: u64, seeks: u64) -> Option<u32> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.track != track || state.seeks != seeks {
+            return None;
+        }
+        state.last_position = state.last_position.max(state.position());
+        Some((state.last_position * 1_000 / u64::from(SAMPLE_RATE)).min(u64::from(u32::MAX)) as u32)
+    }
+
+    fn new_track(&self) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.track = s.track.wrapping_add(1);
+        s.awaiting_position = true;
+        s.epoch = s.epoch.wrapping_add(1);
+        s.origin = 0;
+        s.last_position = 0;
+        s.submitted = 0;
+        s.pending = 0;
+        s.frozen = None;
+    }
+
+    fn start_at(&self, position_ms: u32) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if s.awaiting_position {
+            s.awaiting_position = false;
+            s.origin = u64::from(position_ms) * u64::from(SAMPLE_RATE) / 1_000;
+            s.submitted = s.origin;
+            s.pending = s.origin;
+            s.epoch = s.epoch.wrapping_add(1);
+        }
+    }
+
+    fn seek(&self, position_ms: u32) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.seeks = s.seeks.wrapping_add(1);
+        s.epoch = s.epoch.wrapping_add(1);
+        s.awaiting_position = false;
+        s.origin = u64::from(position_ms) * u64::from(SAMPLE_RATE) / 1_000;
+        s.last_position = s.origin;
+        s.submitted = s.origin;
+        s.pending = s.origin;
+        s.output = ClockOutput::None;
+        s.frozen = None;
+    }
+
+    pub(crate) fn origin(&self) -> (u64, u64) {
+        let s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        (s.epoch, s.origin)
+    }
+
+    pub(crate) fn prepare(&self, position_frames: u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending = position_frames;
+    }
+
+    fn submit_native(
+        &self,
+        queued: &Arc<Queued>,
+        rate: u32,
+        frames: u32,
+        device: fastframe_audio::Clock,
+    ) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        queued
+            .appended
+            .fetch_add(u64::from(frames), Ordering::Relaxed);
+        s.output = ClockOutput::Native {
+            queued: Arc::downgrade(queued),
+            rate,
+            device,
+        };
+        s.submitted = s.pending;
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn submit_latency(&self, latency: Duration) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.output = ClockOutput::Latency {
+            frames: (latency.as_secs_f64() * f64::from(SAMPLE_RATE)) as u64,
+            at: Instant::now(),
+        };
+        s.submitted = s.pending;
+    }
+
+    pub(crate) fn drained(&self) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.output = ClockOutput::None;
+    }
+
+    fn resume(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .frozen = None;
+    }
+
+    pub(crate) fn freeze(&self) {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        s.frozen = Some(s.position());
+    }
+}
+
 /// Frames handed to rodio, and frames it has finished with.
 /// The difference is what is still queued.
+#[derive(Debug)]
 struct Queued {
     appended: AtomicU64,
     consumed: AtomicU64,
+    last_rendered: Mutex<Option<Instant>>,
 }
 
 impl Queued {
@@ -448,6 +692,7 @@ impl Queued {
         Arc::new(Self {
             appended: AtomicU64::new(0),
             consumed: AtomicU64::new(0),
+            last_rendered: Mutex::new(None),
         })
     }
 
@@ -615,6 +860,13 @@ impl Iterator for TransitionSource {
             self.gain = self.interrupt.next_gain() * self.transport.next_gain();
             self.remaining = self.remaining.saturating_sub(1);
             self.queued.consumed.fetch_add(1, Ordering::Relaxed);
+            if self.remaining == 0 {
+                *self
+                    .queued
+                    .last_rendered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+            }
         }
         self.channel = (self.channel + 1) % NUM_CHANNELS as usize;
         Some(sample * self.gain)
@@ -887,6 +1139,13 @@ impl RodioSink {
     }
 }
 
+impl Drop for RodioSink {
+    fn drop(&mut self) {
+        // A queue discarded during shutdown never becomes played audio.
+        self.control.clock.freeze();
+    }
+}
+
 impl Sink for RodioSink {
     /// Never fails: an output that cannot open is reported by the first
     /// `write` instead (#623).
@@ -905,6 +1164,7 @@ impl Sink for RodioSink {
         }
         self.apply_volume();
         if let Some(output) = &mut self.output {
+            self.control.clock.resume();
             output.transport.fade_in();
             output.sink.play();
         }
@@ -915,7 +1175,7 @@ impl Sink for RodioSink {
     /// processing wrapper has already appended the final overlap.
     fn stop(&mut self) -> SinkResult<()> {
         if let Some(output) = &mut self.output {
-            let natural = self.control.take_end_of_track() && self.control.crossfade_on();
+            let natural = self.control.finish_output.swap(false, Ordering::SeqCst);
             if !natural {
                 output.transport.fade_out_over(output.queued.frames());
             }
@@ -927,11 +1187,37 @@ impl Sink for RodioSink {
                 DRAIN_TIMEOUT
             };
             let deadline = Instant::now() + drain;
-            while !output.sink.empty() && !output.failed() && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
+            while !output.sink.empty()
+                && (natural || !output.transport.silent())
+                && !output.failed()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(1));
+            }
+            // The final callback is still in the device's buffer after rodio
+            // becomes empty. Let that reported backlog reach the device too.
+            if output.sink.empty() {
+                let last = *output
+                    .queued
+                    .last_rendered
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if let Some(at) = last {
+                    let until = at + output.device.clock().latency().min(DRAIN_TIMEOUT);
+                    while Instant::now() < until && !output.failed() {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
             }
             output.sink.pause();
-            // With the queue played out, the device can stop asking for
+            if natural && output.sink.empty() {
+                self.control.clock.drained();
+            } else {
+                // Retain the unplayed queue. Stop time at the same boundary
+                // as sound, instead of counting muted frames through a pause.
+                self.control.clock.freeze();
+            }
+            // With playback paused, the device can stop asking for
             // sound until Play: a paused app costs no audio work (#636).
             output.device.pause();
             output.transport.close();
@@ -981,6 +1267,8 @@ impl Sink for RodioSink {
                 .unwrap_or(0);
             log::warn!("audio queue ran dry; next packet arrived after {late_ms} ms");
         }
+        self.control.clock.resume();
+        output.sink.play();
         output.transport.fade_in();
         let frames = (samples.len() / NUM_CHANNELS as usize) as u32;
         let source = rodio::buffer::SamplesBuffer::new(
@@ -988,10 +1276,12 @@ impl Sink for RodioSink {
             output.sample_rate as rodio::SampleRate,
             samples,
         );
-        output
-            .queued
-            .appended
-            .fetch_add(u64::from(frames), Ordering::Relaxed);
+        self.control.clock.submit_native(
+            &output.queued,
+            output.sample_rate,
+            frames,
+            output.device.clock(),
+        );
         output.sink.append(TransitionSource::new(
             source,
             Arc::clone(&output.envelope),
@@ -1318,7 +1608,16 @@ mod tests {
         sink.write(packet(), &mut converter).unwrap();
         assert_eq!(running(&sink), Some(true));
 
+        // A deep queue remains available after Pause. Draining it through
+        // the closed transport used to throw away nearly a second of music.
+        sink.write(
+            AudioPacket::Samples(vec![0.0; SAMPLE_RATE as usize * 2]),
+            &mut converter,
+        )
+        .unwrap();
         assert!(sink.stop().is_ok());
+        let output = sink.output.as_ref().unwrap();
+        assert!(output.queued.frames() > u64::from(output.sample_rate) / 2);
         assert_eq!(running(&sink), Some(false), "paused, the device is quiet");
         assert!(sink.stop().is_ok(), "stopping twice is harmless");
 
@@ -1343,16 +1642,14 @@ mod tests {
     fn with_no_output_at_all_playing_fails_at_the_first_packet_not_at_start() {
         let reported: Arc<Mutex<Vec<String>>> = Arc::default();
         let store = Arc::clone(&reported);
-        let mut sink = RodioSink {
-            open: no_device,
-            ..RodioSink::new(
-                None,
-                Arc::new(move |message| store.lock().unwrap().push(message)),
-                Box::new(librespot_playback::mixer::NoOpVolume),
-                DEFAULT_BUFFER_MS,
-                AudioControl::new(DEFAULT_BUFFER_MS),
-            )
-        };
+        let mut sink = RodioSink::new(
+            None,
+            Arc::new(move |message| store.lock().unwrap().push(message)),
+            Box::new(librespot_playback::mixer::NoOpVolume),
+            DEFAULT_BUFFER_MS,
+            AudioControl::new(DEFAULT_BUFFER_MS),
+        );
+        sink.open = no_device;
         let mut converter = Converter::new(None);
         let packet = || AudioPacket::Samples(vec![0.0; 441 * NUM_CHANNELS as usize]);
 
@@ -1611,6 +1908,101 @@ mod tests {
         assert_eq!(transport.next_gain(), 1.0);
     }
 
+    #[test]
+    fn disabling_crossfade_drains_audio_and_finishes_the_started_curve() {
+        let mut mixer = Crossfade::default();
+        assert!(mixer.process(vec![0.125; 8], 4, false).is_empty());
+        let first = mixer.process(vec![0.25; 2], 4, true);
+        let rest = mixer.process(vec![0.25; 8], 0, false);
+        let output: Vec<_> = first.into_iter().chain(rest).collect();
+        assert_eq!(output.len(), 10);
+        for frame in 0..4 {
+            let angle = (frame as f64 + 0.5) / 4.0 * std::f64::consts::FRAC_PI_2;
+            let expected = 0.125 * angle.cos() + 0.25 * angle.sin();
+            assert!((output[frame * 2] - expected).abs() < 1e-12);
+        }
+        assert_eq!(&output[8..], &[0.25; 2]);
+        assert!(mixer.take_tail().is_empty());
+        mixer.process(vec![0.125; 8], 4, false);
+        assert_eq!(
+            mixer.process(vec![0.25; 2], 0, false),
+            [vec![0.125; 8], vec![0.25; 2]].concat()
+        );
+    }
+
+    #[test]
+    fn the_local_counter_follows_rendered_frames_through_queue_changes_and_seek() {
+        use crate::player::{LocalState, Playback};
+        for rate in [44_100, 48_000] {
+            let clock = Arc::new(PlaybackClock::default());
+            clock.new_track();
+            clock.start_at(0);
+            let queued = Queued::new();
+            let mut local = LocalState {
+                playback: Playback::Playing,
+                position_ms: 13_000, // Decoder is 12 seconds ahead of this output.
+                position_at: Some(Instant::now()),
+                track_sequence: 1,
+                audio_clock: Some(Arc::clone(&clock)),
+                ..Default::default()
+            };
+            clock.prepare(u64::from(SAMPLE_RATE));
+            clock.submit_native(&queued, rate, rate, Default::default());
+            let interrupt = Envelope::open(rate, INTERRUPT_FADE);
+            let transport = Envelope::open(rate, TRANSPORT_FADE);
+            let mut source = TransitionSource::new(
+                rodio::buffer::SamplesBuffer::new(2, rate, vec![0.125; rate as usize * 2]),
+                Arc::clone(&interrupt),
+                Arc::clone(&transport),
+                Arc::clone(&queued),
+                rate,
+            );
+            assert_eq!(local.position_now(), 0);
+            for _ in 0..rate / 4 * 2 {
+                source.next().unwrap();
+            }
+            assert_eq!(local.position_now(), 250);
+            local.playback = Playback::Paused;
+            assert_eq!(local.position_now(), 250);
+            local.playback = Playback::Playing;
+            // Disabling or shortening releases four seconds already held by
+            // the mixer. It becomes queued sound, not four seconds on the UI.
+            clock.prepare(5 * u64::from(SAMPLE_RATE));
+            clock.submit_native(&queued, rate, rate * 4, Default::default());
+            assert_eq!(local.position_now(), 250);
+            for _ in 0..rate / 4 * 2 {
+                source.next().unwrap();
+            }
+            assert_eq!(local.position_now(), 500);
+            clock.freeze();
+            drop(source); // Discarding unplayed frames must not advance time.
+            assert_eq!(local.position_now(), 500);
+            clock.seek(10_000);
+            local.audio_seek_sequence = 1;
+            local.confirmed_audio_seek = Some((1, 10_000));
+            let queued = Queued::new();
+            clock.prepare(11 * u64::from(SAMPLE_RATE));
+            clock.submit_native(&queued, rate, rate, Default::default());
+            let mut source = TransitionSource::new(
+                rodio::buffer::SamplesBuffer::new(2, rate, vec![0.25; rate as usize * 2]),
+                interrupt,
+                transport,
+                queued,
+                rate,
+            );
+            assert_eq!(local.position_now(), 10_000);
+            for _ in 0..rate / 4 * 2 {
+                source.next().unwrap();
+            }
+            assert_eq!(local.position_now(), 10_250);
+            clock.new_track();
+            local.track_sequence = 2;
+            assert_eq!(local.position_now(), 0);
+            clock.start_at(5_000); // A load/reconnect at a non-zero position.
+            assert_eq!(local.position_now(), 5_000);
+        }
+    }
+
     /// The Settings slider runs from off to the longest fade.
     #[test]
     fn the_crossfade_slider_runs_from_off_to_twelve_seconds() {
@@ -1781,10 +2173,6 @@ mod tests {
         assert!(short_progress.is_none());
         assert_eq!(whole.len(), overlap * channels);
         assert_eq!(whole_tail.len(), overlap * channels);
-        assert_eq!(
-            take_crossfade(&mut tail, &mut progress, vec![0.5; channels], 0, false),
-            vec![0.5; channels],
-        );
     }
 
     /// The overlap uses an equal-power curve. The outgoing song starts at

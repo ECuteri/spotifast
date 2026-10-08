@@ -676,7 +676,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         .changed()
                     {
                         changed = true;
-                        playback_dirty = true;
+                        app.actions.push(Action::UpdateCrossfade);
                     }
                     let mut seconds = app
                         .settings
@@ -701,7 +701,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     {
                         app.settings.crossfade_secs = seconds;
                         changed = true;
-                        playback_dirty = true;
+                        app.actions.push(Action::UpdateCrossfade);
                     }
                 });
             });

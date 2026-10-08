@@ -170,6 +170,12 @@ pub struct LocalState {
     pub position_ms: u32,
     /// When `position_ms` was observed; `None` while not advancing.
     pub position_at: Option<Instant>,
+    /// The shared output clock survives snapshots and advances only with sound.
+    pub(crate) audio_clock: Option<Arc<crate::sink::PlaybackClock>>,
+    /// Actual seeks only, unlike seek_sequence which also notifies media
+    /// controls when a repeated track restarts.
+    pub(crate) audio_seek_sequence: u64,
+    pub(crate) confirmed_audio_seek: Option<(u64, u32)>,
     pub volume: u16,
     pub shuffle: bool,
     pub repeat: RepeatMode,
@@ -220,6 +226,29 @@ impl LocalState {
 
     /// The position now, interpolated from the last report while playing.
     pub fn position_now(&self) -> u32 {
+        if let Some(clock) = &self.audio_clock {
+            if self.playback == Playback::Stopped {
+                return 0;
+            }
+            let position = clock
+                .position_ms(self.track_sequence, self.audio_seek_sequence)
+                .unwrap_or_else(|| {
+                    self.confirmed_audio_seek
+                        .filter(|(track, _)| *track == self.track_sequence)
+                        .map_or(
+                            if self.playback == Playback::Paused {
+                                self.position_ms
+                            } else {
+                                0
+                            },
+                            |(_, position)| position,
+                        )
+                });
+            return self
+                .track
+                .as_ref()
+                .map_or(position, |track| position.min(track.duration_ms));
+        }
         match (self.playback, self.position_at) {
             (Playback::Playing, Some(at)) => {
                 let elapsed = at.elapsed().as_millis() as u32;
@@ -344,7 +373,9 @@ impl Engine {
         let normalisation_factor = Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits()));
         let player_config = PlayerConfig {
             bitrate: config.bitrate(),
-            gapless: config.gapless || !config.crossfade.is_zero(),
+            // Keep the decoder running across loads. The shared sink enforces
+            // Gapless when crossfade is off, including after a live change.
+            gapless: true,
             normalisation: config.normalisation,
             normalisation_type: NormalisationType::Auto,
             position_update_interval: Some(Duration::from_secs(1)),
@@ -373,6 +404,15 @@ impl Engine {
         }));
         let session = Session::new(session_config, Some(cache));
         let audio = AudioControl::with_crossfade(config.buffer_ms, config.crossfade);
+        audio.set_gapless(config.gapless);
+        // Pipe/subprocess have no device consumption API. Preserve their
+        // decoder clock; the selectable native/Pulse outputs use played audio.
+        if librespot_backend(config.backend.as_deref()).is_none()
+            || config.backend.as_deref() == Some("pulseaudio")
+        {
+            state.lock().unwrap_or_else(|p| p.into_inner()).audio_clock =
+                Some(Arc::clone(&audio.clock));
+        }
         let (sink_builder, volume) = sink_builder(
             config,
             Arc::clone(&state),
@@ -584,6 +624,10 @@ impl Engine {
         }
     }
 
+    pub(crate) fn set_crossfade(&self, duration: Duration) {
+        self.audio.set_crossfade(duration);
+    }
+
     pub fn command(&self, command: PlayerCommand) -> Result<()> {
         let interrupts_audio = command_interrupts_audio(
             &self.state.lock().unwrap_or_else(|p| p.into_inner()),
@@ -712,10 +756,19 @@ fn sink_builder(
     if let Some(builder) = librespot_backend(config.backend.as_deref()) {
         // Apply volume after the tap so visualizers are independent of
         // volume, including at zero.
+        #[cfg(target_os = "linux")]
+        let config_backend_is_pulse = config.backend.as_deref() == Some("pulseaudio");
         let applied = mixer.get_soft_volume();
         let normalisation = Arc::clone(&normalisation);
         return (
             Box::new(move || {
+                #[cfg(target_os = "linux")]
+                let sink: Box<dyn Sink> = if config_backend_is_pulse {
+                    Box::new(crate::pulse::PulseSink::new(device, Arc::clone(&audio)))
+                } else {
+                    builder(device, AudioFormat::S16)
+                };
+                #[cfg(not(target_os = "linux"))]
                 let sink = builder(device, AudioFormat::S16);
                 Box::new(Tapped::new(
                     sink,
@@ -880,6 +933,8 @@ fn apply_event(state: &mut LocalState, event: PlayerEvent) -> bool {
             true
         }
         PlayerEvent::Seeked { position_ms, .. } => {
+            state.audio_seek_sequence = state.audio_seek_sequence.wrapping_add(1);
+            state.confirmed_audio_seek = Some((state.track_sequence, position_ms));
             state.position_ms = position_ms;
             if state.playback == Playback::Playing {
                 state.position_at = Some(Instant::now());
