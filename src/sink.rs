@@ -77,15 +77,21 @@ pub const CROSSFADE_MAX: Duration = Duration::from_secs(12);
 /// A four second fade, inside the slider's range.
 pub const CROSSFADE_DEFAULT: Duration = Duration::from_secs(4);
 
+/// Keeps the fade's position stable across decoder packets.
+struct CrossfadeProgress {
+    frames: usize,
+    mixed: usize,
+}
+
 /// Holds the last `overlap` frames of a song and mixes the next one into them.
 ///
 /// `overlap` of zero returns `samples` unchanged. While a song plays, each
 /// call releases what falls outside the window and keeps the rest. The first
-/// call of a new song (`crossing`) mixes the kept tail with the new start,
-/// then holds the new song's own tail the same way.
+/// call of a new song (`crossing`) begins mixing the kept tail with the new
+/// start. Subsequent packets continue that mix before holding the new tail.
 fn take_crossfade(
     tail: &mut VecDeque<f32>,
-    incoming: &mut VecDeque<f32>,
+    progress: &mut Option<CrossfadeProgress>,
     samples: Vec<f32>,
     overlap: usize,
     crossing: bool,
@@ -95,35 +101,33 @@ fn take_crossfade(
     }
     let channels = NUM_CHANNELS as usize;
     let keep = overlap * channels;
-    if !crossing {
-        tail.extend(samples);
-        if tail.len() <= keep {
-            return Vec::new();
+    if crossing {
+        let frames = overlap.min(tail.len() / channels);
+        *progress = (frames > 0).then_some(CrossfadeProgress { frames, mixed: 0 });
+    }
+    let mut output = Vec::with_capacity(samples.len());
+    let mut consumed = 0;
+    if let Some(fade) = progress {
+        for incoming in samples
+            .chunks_exact(channels)
+            .take(fade.frames - fade.mixed)
+        {
+            let outgoing: [f32; NUM_CHANNELS as usize] =
+                std::array::from_fn(|_| tail.pop_front().unwrap_or(0.0));
+            let t = (fade.mixed as f32 + 0.5) / fade.frames as f32;
+            output.extend(mix_frame(&outgoing, incoming, t));
+            fade.mixed += 1;
+            consumed += channels;
         }
-        let release = tail.len() - keep;
-        return tail.drain(..release).collect();
+        if fade.mixed == fade.frames {
+            *progress = None;
+        }
     }
-    incoming.extend(samples);
-    let frames = overlap.min(tail.len() / channels);
-    let mut mixed = Vec::with_capacity(frames * channels);
-    for index in 0..frames {
-        let outgoing: Vec<f32> = tail.drain(..channels).collect();
-        let arrived: Vec<f32> = (0..channels)
-            .map(|_| incoming.pop_front().unwrap_or(0.0))
-            .collect();
-        let t = (index as f32 + 0.5) / frames.max(1) as f32;
-        mixed.extend(mix_frame(&outgoing, &arrived, t));
-    }
-    // A song shorter than the overlap has no tail left to mix, so the rest
-    // of the new song follows immediately.
-    mixed.extend(tail.drain(..));
-    mixed.extend(incoming.drain(..));
-    if mixed.len() <= keep {
-        tail.extend(mixed);
-        return Vec::new();
-    }
-    tail.extend(mixed.drain(keep..));
-    mixed
+    // Only audio beyond the current overlap becomes the new song's held tail.
+    tail.extend(samples[consumed..].iter().copied());
+    let release = tail.len().saturating_sub(keep);
+    output.extend(tail.drain(..release));
+    output
 }
 
 /// Equal-power mix of one outgoing frame and one incoming frame.
@@ -606,8 +610,8 @@ struct Output {
     /// the overlap. Empty for the rest of the song, and always when the
     /// feature is off.
     tail: VecDeque<f32>,
-    /// Incoming samples waiting to be mixed with `tail`.
-    incoming: VecDeque<f32>,
+    /// Progress of an overlap that spans multiple decoder packets.
+    crossfade_progress: Option<CrossfadeProgress>,
     /// Set when the next packet belongs to a new song, so its start mixes
     /// with the tail instead of being appended after it.
     crossing: bool,
@@ -635,7 +639,7 @@ impl Output {
         self.fed = false;
         self.last_write = None;
         self.tail.clear();
-        self.incoming.clear();
+        self.crossfade_progress = None;
         self.crossing = false;
     }
 
@@ -686,7 +690,7 @@ impl Output {
         let crossing = std::mem::take(&mut self.crossing);
         take_crossfade(
             &mut self.tail,
-            &mut self.incoming,
+            &mut self.crossfade_progress,
             samples,
             overlap,
             crossing,
@@ -934,7 +938,7 @@ impl Sink for RodioSink {
                 output.crossing = false;
             } else {
                 output.tail.clear();
-                output.incoming.clear();
+                output.crossfade_progress = None;
                 output.crossing = false;
             }
         }
@@ -971,7 +975,7 @@ impl Sink for RodioSink {
             output.fed = false;
             output.last_write = None;
             output.tail.clear();
-            output.incoming.clear();
+            output.crossfade_progress = None;
             output.crossing = false;
             self.applied_volume = -1.0;
         }
@@ -1126,7 +1130,7 @@ fn open_output(
         fed: false,
         last_write: None,
         tail: VecDeque::new(),
-        incoming: VecDeque::new(),
+        crossfade_progress: None,
         crossing: false,
     };
     output.attach((mixer, sample_rate), control);
@@ -1759,14 +1763,13 @@ mod tests {
     /// Off, it passes the audio straight through and keeps nothing.
     #[test]
     fn crossfade_holds_only_the_overlap_and_mixes_the_next_song_into_it() {
-        let mut tail = VecDeque::new();
-        let mut incoming = VecDeque::new();
         let channels = NUM_CHANNELS as usize;
         let overlap = 4;
-
+        let mut tail = VecDeque::new();
+        let mut progress = None;
         let passed = take_crossfade(
             &mut tail,
-            &mut incoming,
+            &mut progress,
             vec![1.0; overlap * 3 * channels],
             overlap,
             false,
@@ -1774,21 +1777,43 @@ mod tests {
         assert_eq!(passed, vec![1.0; overlap * 2 * channels]);
         assert_eq!(tail.len(), overlap * channels);
 
-        let mixed = take_crossfade(
-            &mut tail,
-            &mut incoming,
-            vec![0.0; overlap * 2 * channels],
+        let outgoing: VecDeque<_> = [1.0, 0.0].repeat(overlap).into();
+        let incoming = [0.0, 1.0].repeat(overlap * 2);
+        let mut whole_tail = outgoing.clone();
+        let mut whole_progress = None;
+        let whole = take_crossfade(
+            &mut whole_tail,
+            &mut whole_progress,
+            incoming.clone(),
             overlap,
             true,
         );
-        assert_eq!(mixed.len(), overlap * channels);
-        assert!(mixed.iter().any(|sample| *sample > 0.0 && *sample < 1.0));
-        assert_eq!(tail.len(), overlap * channels);
-        assert!(incoming.is_empty());
-
+        for packet_frames in [1, 2, 4, 8] {
+            let mut tail = outgoing.clone();
+            let mut progress = None;
+            let mut mixed = Vec::new();
+            for (index, packet) in incoming.chunks(packet_frames * channels).enumerate() {
+                mixed.extend(take_crossfade(
+                    &mut tail,
+                    &mut progress,
+                    packet.to_vec(),
+                    overlap,
+                    index == 0,
+                ));
+            }
+            assert_eq!(mixed, whole, "packet size must not change the fade");
+            assert_eq!(tail, whole_tail);
+            assert!(progress.is_none());
+            for frame in mixed.chunks_exact(channels) {
+                let power = frame.iter().map(|sample| sample * sample).sum::<f32>();
+                assert!((power - 1.0).abs() < 0.001);
+            }
+        }
+        assert_eq!(whole.len(), overlap * channels);
+        assert_eq!(whole_tail.len(), overlap * channels);
         assert_eq!(
-            take_crossfade(&mut tail, &mut incoming, vec![0.5; channels], 0, false),
-            vec![0.5; channels]
+            take_crossfade(&mut tail, &mut progress, vec![0.5; channels], 0, false),
+            vec![0.5; channels],
         );
     }
 
