@@ -344,7 +344,7 @@ impl Engine {
         let normalisation_factor = Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits()));
         let player_config = PlayerConfig {
             bitrate: config.bitrate(),
-            gapless: config.gapless,
+            gapless: config.gapless || !config.crossfade.is_zero(),
             normalisation: config.normalisation,
             normalisation_type: NormalisationType::Auto,
             position_update_interval: Some(Duration::from_secs(1)),
@@ -382,13 +382,9 @@ impl Engine {
             Arc::clone(&audio),
         );
         let player = Player::new(player_config, session.clone(), volume, sink_builder);
+        audio.follow_events(player.get_player_event_channel());
         let events = player.get_player_event_channel();
-        tokio::spawn(run_events(
-            events,
-            Arc::clone(&state),
-            Arc::clone(&notify),
-            Arc::clone(&audio),
-        ));
+        tokio::spawn(run_events(events, Arc::clone(&state), Arc::clone(&notify)));
 
         let connect_config = ConnectConfig {
             name: config.device_name.clone(),
@@ -791,7 +787,6 @@ async fn run_events(
     mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>,
     state: Arc<Mutex<LocalState>>,
     notify: Notify,
-    audio: Arc<AudioControl>,
 ) {
     let mut play_request_id = None;
     while let Some(event) = events.recv().await {
@@ -807,7 +802,6 @@ async fn run_events(
         {
             continue;
         }
-        audio.handle_player_event(&event);
         let snapshot = {
             let mut current = state.lock().unwrap_or_else(|p| p.into_inner());
             if apply_event(&mut current, event) {

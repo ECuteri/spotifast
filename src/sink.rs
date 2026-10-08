@@ -68,14 +68,48 @@ const INTERRUPT_FADE: Duration = Duration::from_millis(50);
 
 /// Longest song-to-song crossfade the Settings slider offers.
 ///
-/// librespot decodes one song at a time and only resolves the next one as the
-/// current one ends, so the overlap is the end of the current song held until
+/// librespot writes one decoded song at a time, so the overlap is the end
+/// of the current song held until
 /// the next one starts. The slider stops at twelve seconds: past that the
 /// hold is a delay, not a fade anyone hears as longer.
 pub const CROSSFADE_MAX: Duration = Duration::from_secs(12);
 
 /// A four second fade, inside the slider's range.
 pub const CROSSFADE_DEFAULT: Duration = Duration::from_secs(4);
+
+/// Holds post-EQ audio before backend conversion, limiting and volume.
+#[derive(Default)]
+pub(crate) struct Crossfade {
+    tail: VecDeque<f64>,
+    progress: Option<CrossfadeProgress>,
+}
+
+impl Crossfade {
+    pub(crate) fn process(
+        &mut self,
+        samples: Vec<f64>,
+        overlap: usize,
+        crossing: bool,
+    ) -> Vec<f64> {
+        take_crossfade(
+            &mut self.tail,
+            &mut self.progress,
+            samples,
+            overlap,
+            crossing,
+        )
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.tail.clear();
+        self.progress = None;
+    }
+
+    pub(crate) fn take_tail(&mut self) -> Vec<f64> {
+        self.progress = None;
+        self.tail.drain(..).collect()
+    }
+}
 
 /// Keeps the fade's position stable across decoder packets.
 struct CrossfadeProgress {
@@ -90,31 +124,33 @@ struct CrossfadeProgress {
 /// call of a new song (`crossing`) begins mixing the kept tail with the new
 /// start. Subsequent packets continue that mix before holding the new tail.
 fn take_crossfade(
-    tail: &mut VecDeque<f32>,
+    tail: &mut VecDeque<f64>,
     progress: &mut Option<CrossfadeProgress>,
-    samples: Vec<f32>,
+    samples: Vec<f64>,
     overlap: usize,
     crossing: bool,
-) -> Vec<f32> {
+) -> Vec<f64> {
     if overlap == 0 {
         return samples;
     }
     let channels = NUM_CHANNELS as usize;
     let keep = overlap * channels;
+    let mut output = Vec::with_capacity(samples.len());
     if crossing {
         let frames = overlap.min(tail.len() / channels);
+        let prefix = tail.len().saturating_sub(frames * channels);
+        output.extend(tail.drain(..prefix));
         *progress = (frames > 0).then_some(CrossfadeProgress { frames, mixed: 0 });
     }
-    let mut output = Vec::with_capacity(samples.len());
     let mut consumed = 0;
     if let Some(fade) = progress {
         for incoming in samples
             .chunks_exact(channels)
             .take(fade.frames - fade.mixed)
         {
-            let outgoing: [f32; NUM_CHANNELS as usize] =
+            let outgoing: [f64; NUM_CHANNELS as usize] =
                 std::array::from_fn(|_| tail.pop_front().unwrap_or(0.0));
-            let t = (fade.mixed as f32 + 0.5) / fade.frames as f32;
+            let t = (fade.mixed as f64 + 0.5) / fade.frames as f64;
             output.extend(mix_frame(&outgoing, incoming, t));
             fade.mixed += 1;
             consumed += channels;
@@ -135,8 +171,8 @@ fn take_crossfade(
 /// `t` runs from 0 at the start of the overlap to 1 at its end. Each side is
 /// a quarter-sine, so the two gains stay at a constant combined power and the
 /// middle of the fade does not dip.
-fn mix_frame(outgoing: &[f32], incoming: &[f32], t: f32) -> [f32; NUM_CHANNELS as usize] {
-    let angle = t.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+fn mix_frame(outgoing: &[f64], incoming: &[f64], t: f64) -> [f64; NUM_CHANNELS as usize] {
+    let angle = t.clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2;
     // `sin_cos` is `(sin, cos)`. The outgoing song is the cosine, full at the
     // start of the overlap and gone at the end; the incoming song is the sine.
     let (fade_in, fade_out) = angle.sin_cos();
@@ -175,6 +211,8 @@ pub const BUFFER_MS_RANGE: std::ops::RangeInclusive<u32> = 20..=500;
 /// the decoder that has already moved to the requested position.
 pub struct AudioControl {
     target: Mutex<AudioTarget>,
+    /// Dedicated events, published by the decoder before its sink calls.
+    events: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>>>,
     waiting_for_track: AtomicBool,
     reset_output: AtomicBool,
     /// A skip or a seek drops the held crossfade tail. A pause does not
@@ -190,6 +228,7 @@ pub struct AudioControl {
     /// Song-to-song overlap. Zero keeps the ordinary gapless handoff and
     /// holds nothing back.
     crossfade: Duration,
+    track_duration_ms: AtomicU32,
 }
 
 #[derive(Default)]
@@ -211,6 +250,7 @@ impl AudioControl {
     pub fn with_crossfade(buffer_ms: u32, crossfade: Duration) -> Arc<Self> {
         Arc::new(Self {
             target: Mutex::new(AudioTarget::default()),
+            events: Mutex::new(None),
             waiting_for_track: AtomicBool::new(false),
             reset_output: AtomicBool::new(false),
             drop_tail: AtomicBool::new(false),
@@ -218,29 +258,60 @@ impl AudioControl {
             reset_processing: AtomicBool::new(false),
             buffer_ms: buffer_ms.clamp(*BUFFER_MS_RANGE.start(), *BUFFER_MS_RANGE.end()),
             crossfade: crossfade.min(CROSSFADE_MAX),
+            track_duration_ms: AtomicU32::new(0),
         })
     }
 
-    /// Frames of one channel the overlap lasts, at the rate the samples
-    /// have when they are mixed. That is the device rate: resampling has
-    /// already happened, and measuring the window at Spotify's rate would
-    /// stretch or shrink the fade on a device that runs at another one.
-    fn crossfade_frames(&self, sample_rate: u32) -> usize {
-        (self.crossfade.as_secs_f64() * f64::from(sample_rate)).ceil() as usize
+    /// Frames of one channel in the overlap, before backend resampling.
+    pub(crate) fn crossfade_frames(&self, sample_rate: u32) -> usize {
+        let duration_ms = self.track_duration_ms.load(Ordering::SeqCst);
+        let overlap = if duration_ms == 0 {
+            self.crossfade
+        } else {
+            self.crossfade
+                .min(Duration::from_millis(u64::from(duration_ms)))
+        };
+        (overlap.as_secs_f64() * f64::from(sample_rate)).ceil() as usize
+    }
+
+    pub(crate) fn follow_events(&self, events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
+        *self.events.lock().unwrap_or_else(PoisonError::into_inner) = Some(events);
+    }
+
+    /// Read on the decoder thread, before start, write or stop. The UI's
+    /// asynchronous event task cannot move an audio boundary after a packet.
+    pub(crate) fn drain_events(&self) {
+        let mut events = self.events.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(events) = events.as_mut() {
+            while let Ok(event) = events.try_recv() {
+                self.handle_player_event(&event);
+            }
+        }
+    }
+
+    pub(crate) fn ended(&self) -> bool {
+        self.end_of_track.load(Ordering::SeqCst)
     }
 
     /// Follows confirmed decoder transitions, including seeks requested by
     /// another Spotify client. Natural track changes retain gapless audio.
     pub(crate) fn handle_player_event(&self, event: &PlayerEvent) {
         match event {
-            PlayerEvent::TrackChanged { .. } => {
-                self.end_of_track.store(false, Ordering::SeqCst);
-                self.note_track_change();
+            PlayerEvent::TrackChanged { audio_item } => {
+                let natural = self.end_of_track.swap(false, Ordering::SeqCst);
+                self.track_duration_ms
+                    .store(audio_item.duration_ms, Ordering::SeqCst);
+                if natural {
+                    self.note_track_change();
+                } else if self.crossfade_on() {
+                    self.interrupt();
+                }
                 self.track_changed();
             }
             PlayerEvent::Seeked { .. } => {
                 self.end_of_track.store(false, Ordering::SeqCst);
-                let target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
+                let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
+                target.crossing = false;
                 if let Some(sink) = target.sink.upgrade() {
                     sink.stop();
                 }
@@ -275,7 +346,8 @@ impl AudioControl {
             return;
         }
         let (sink, envelope) = {
-            let target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut target = self.target.lock().unwrap_or_else(PoisonError::into_inner);
+            target.crossing = false;
             (target.sink.upgrade(), target.envelope.clone())
         };
         if let (Some(sink), Some(envelope)) = (&sink, &envelope) {
@@ -316,7 +388,7 @@ impl AudioControl {
         self.waiting_for_track.store(false, Ordering::SeqCst);
     }
 
-    fn waiting_for_track(&self) -> bool {
+    pub(crate) fn waiting_for_track(&self) -> bool {
         self.waiting_for_track.load(Ordering::SeqCst)
     }
 
@@ -332,7 +404,7 @@ impl AudioControl {
 
     /// Whether the next packet starts a new song that should mix with the
     /// held tail. Reading it clears the mark, so only that packet crosses.
-    fn take_crossing(&self) -> bool {
+    pub(crate) fn take_crossing(&self) -> bool {
         if self.crossfade.is_zero() {
             return false;
         }
@@ -342,18 +414,18 @@ impl AudioControl {
 
     /// A skip or a seek throws the held tail away. A pause does not: Play
     /// has to resume the same song, overlap included.
-    fn take_drop_tail(&self) -> bool {
+    pub(crate) fn take_drop_tail(&self) -> bool {
         self.drop_tail.swap(false, Ordering::SeqCst)
     }
 
     /// The song that just finished had nothing after it, so the stop that
     /// follows plays the held overlap out instead of keeping it for a resume.
-    fn take_end_of_track(&self) -> bool {
+    pub(crate) fn take_end_of_track(&self) -> bool {
         self.end_of_track.swap(false, Ordering::SeqCst)
     }
 
     /// Whether a crossfade is configured. Zero is the ordinary path.
-    fn crossfade_on(&self) -> bool {
+    pub(crate) fn crossfade_on(&self) -> bool {
         !self.crossfade.is_zero()
     }
 
@@ -606,15 +678,6 @@ struct Output {
     /// Whether this track has supplied audio since its last stop.
     fed: bool,
     last_write: Option<Instant>,
-    /// The end of the song, kept only while a crossfade is on and only for
-    /// the overlap. Empty for the rest of the song, and always when the
-    /// feature is off.
-    tail: VecDeque<f32>,
-    /// Progress of an overlap that spans multiple decoder packets.
-    crossfade_progress: Option<CrossfadeProgress>,
-    /// Set when the next packet belongs to a new song, so its start mixes
-    /// with the tail instead of being appended after it.
-    crossing: bool,
 }
 
 impl Output {
@@ -638,9 +701,6 @@ impl Output {
         self.queued = Queued::new();
         self.fed = false;
         self.last_write = None;
-        self.tail.clear();
-        self.crossfade_progress = None;
-        self.crossing = false;
     }
 
     /// Has the device ask for sound, reopening it if it failed, moved to a
@@ -675,55 +735,6 @@ impl Output {
         };
         self.attach(mixer, control);
         Ok(true)
-    }
-
-    /// Passes `samples` through, holding back the last `overlap` frames so
-    /// the next song can mix with them.
-    ///
-    /// `overlap` of zero returns the samples unchanged and keeps nothing.
-    /// While a song plays, each call releases what falls outside that window
-    /// and keeps the rest. The first call of a new song mixes the kept tail
-    /// with the new start, one frame at a time, then holds the new song's
-    /// own tail the same way. A song shorter than the window plays out on
-    /// the next song's arrival, so nothing is left behind at the end.
-    fn crossfade(&mut self, samples: Vec<f32>, overlap: usize) -> Vec<f32> {
-        let crossing = std::mem::take(&mut self.crossing);
-        take_crossfade(
-            &mut self.tail,
-            &mut self.crossfade_progress,
-            samples,
-            overlap,
-            crossing,
-        )
-    }
-
-    /// Hands the held tail to the output and forgets it.
-    ///
-    /// The end of a song calls this so the last overlap still plays when
-    /// nothing follows it. A pause does not: that tail has to be there when
-    /// the same song resumes. A song that does follow mixes the tail
-    /// instead, through [`Self::crossfade`].
-    fn play_tail(&mut self) {
-        if self.tail.is_empty() {
-            return;
-        }
-        let samples: Vec<f32> = self.tail.drain(..).collect();
-        let frames = (samples.len() / NUM_CHANNELS as usize) as u32;
-        let source = rodio::buffer::SamplesBuffer::new(
-            NUM_CHANNELS as rodio::ChannelCount,
-            self.sample_rate as rodio::SampleRate,
-            samples,
-        );
-        self.queued
-            .appended
-            .fetch_add(u64::from(frames), Ordering::Relaxed);
-        self.sink.append(TransitionSource::new(
-            source,
-            Arc::clone(&self.envelope),
-            Arc::clone(&self.transport),
-            Arc::clone(&self.queued),
-            frames,
-        ));
     }
 }
 
@@ -900,30 +911,22 @@ impl Sink for RodioSink {
         Ok(())
     }
 
-    /// Never fails: librespot exits the process when a sink cannot stop.
-    ///
-    /// librespot calls this for a pause as well as for the end of playback,
-    /// so the two have to be told apart. A pause keeps the held crossfade
-    /// tail: the audible fade is the transport envelope, and the overlap
-    /// stays buffered for the resume. A skip, a seek, or the last song
-    /// ending plays that tail out. The last case is marked by `EndOfTrack`,
-    /// which arrives before this stop and is not set for a pause.
+    /// A natural end drains all queued audio without the pause ramp. The
+    /// processing wrapper has already appended the final overlap.
     fn stop(&mut self) -> SinkResult<()> {
         if let Some(output) = &mut self.output {
-            if self.control.take_drop_tail()
-                || self.control.take_end_of_track()
-                || !self.control.crossfade_on()
-            {
-                output.play_tail();
+            let natural = self.control.take_end_of_track() && self.control.crossfade_on();
+            if !natural {
+                output.transport.fade_out_over(output.queued.frames());
             }
-            // The drain below plays the queue out, so the ramp is cut to
-            // what is in it. During steady playback that is the whole
-            // 50 ms; just after a seek or a track change it is whatever has
-            // been decoded since. The held tail is not in this queue, so a
-            // pause does not sit here while up to twelve seconds of overlap
-            // play out in silence.
-            output.transport.fade_out_over(output.queued.frames());
-            let deadline = Instant::now() + DRAIN_TIMEOUT;
+            let drain = if natural {
+                Duration::from_secs_f64(
+                    output.queued.frames() as f64 / f64::from(output.sample_rate),
+                ) + DRAIN_TIMEOUT
+            } else {
+                DRAIN_TIMEOUT
+            };
+            let deadline = Instant::now() + drain;
             while !output.sink.empty() && !output.failed() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
@@ -934,13 +937,6 @@ impl Sink for RodioSink {
             output.transport.close();
             output.fed = false;
             output.last_write = None;
-            if self.control.crossfade_on() {
-                output.crossing = false;
-            } else {
-                output.tail.clear();
-                output.crossfade_progress = None;
-                output.crossing = false;
-            }
         }
         Ok(())
     }
@@ -949,15 +945,6 @@ impl Sink for RodioSink {
         let samples = packet
             .samples()
             .map_err(|error| SinkError::OnWrite(error.to_string()))?;
-        if self.control.waiting_for_track() {
-            // Muting must not remove decoder backpressure. Otherwise cached
-            // audio races to EndOfTrack while Connect is still handling the
-            // replacement load, and that old event can skip the chosen song.
-            // Pace one discarded packet, then let librespot process commands.
-            let frames = samples.len() / NUM_CHANNELS as usize;
-            thread::sleep(Duration::from_secs_f64(frames as f64 / SAMPLE_RATE as f64));
-            return Ok(());
-        }
         let samples = converter.f64_to_f32(samples);
         // Sound arriving without a Play first still has a device to go to.
         self.ensure_open()?;
@@ -974,9 +961,6 @@ impl Sink for RodioSink {
                 Resampler::new(SAMPLE_RATE, output.sample_rate, NUM_CHANNELS as usize);
             output.fed = false;
             output.last_write = None;
-            output.tail.clear();
-            output.crossfade_progress = None;
-            output.crossing = false;
             self.applied_volume = -1.0;
         }
         self.apply_volume();
@@ -989,10 +973,6 @@ impl Sink for RodioSink {
             Some(resampler) => resampler.process(&samples),
             None => samples,
         };
-        if self.control.take_crossing() {
-            output.crossing = true;
-        }
-        let samples = output.crossfade(samples, self.control.crossfade_frames(output.sample_rate));
         let now = Instant::now();
         if output.fed && output.sink.empty() && !output.sink.is_paused() {
             let late_ms = output
@@ -1129,9 +1109,6 @@ fn open_output(
         queued: Queued::new(),
         fed: false,
         last_write: None,
-        tail: VecDeque::new(),
-        crossfade_progress: None,
-        crossing: false,
     };
     output.attach((mixer, sample_rate), control);
     Ok(output)
@@ -1450,34 +1427,6 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupted_decoder_cannot_race_to_the_end_while_a_new_track_loads() {
-        let control = AudioControl::new(DEFAULT_BUFFER_MS);
-        control.interrupt();
-        let mut sink = RodioSink::new(
-            None,
-            Arc::new(|error| panic!("no audio device should be opened: {error}")),
-            Box::new(librespot_playback::mixer::NoOpVolume),
-            DEFAULT_BUFFER_MS,
-            control,
-        );
-        let mut converter = Converter::new(None);
-        let frames = SAMPLE_RATE as usize / 100;
-        let started = Instant::now();
-        for _ in 0..4 {
-            sink.write(
-                AudioPacket::Samples(vec![0.0; frames * NUM_CHANNELS as usize]),
-                &mut converter,
-            )
-            .unwrap();
-        }
-        assert!(
-            started.elapsed() >= Duration::from_millis(40),
-            "discarded audio must retain backpressure until the new load reaches the decoder"
-        );
-        assert!(sink.output.is_none());
-    }
-
-    #[test]
     fn confirmed_seek_discards_the_old_position_without_gating_new_packets() {
         let control = AudioControl::new(DEFAULT_BUFFER_MS);
         let (sink, mut output) = rodio::Sink::new();
@@ -1540,6 +1489,10 @@ mod tests {
                 disc_number: 1,
             },
         };
+        control.handle_player_event(&PlayerEvent::EndOfTrack {
+            play_request_id: 1,
+            track_id: track_id.clone(),
+        });
         for event in [
             PlayerEvent::TrackChanged {
                 audio_item: Box::new(item),
@@ -1735,7 +1688,9 @@ mod tests {
         }
     }
 
-    fn song(track_id: &librespot_core::SpotifyUri) -> librespot_metadata::audio::AudioItem {
+    pub(super) fn song(
+        track_id: &librespot_core::SpotifyUri,
+    ) -> librespot_metadata::audio::AudioItem {
         use librespot_metadata::audio::{AudioItem, UniqueFields};
         AudioItem {
             track_id: track_id.clone(),
@@ -1805,10 +1760,25 @@ mod tests {
             assert_eq!(tail, whole_tail);
             assert!(progress.is_none());
             for frame in mixed.chunks_exact(channels) {
-                let power = frame.iter().map(|sample| sample * sample).sum::<f32>();
+                let power = frame.iter().map(|sample| sample * sample).sum::<f64>();
                 assert!((power - 1.0).abs() < 0.001);
             }
         }
+        // A very short incoming track shortens the overlap, without losing
+        // the outgoing prefix or carrying it into a third track.
+        let mut short_tail = outgoing.clone();
+        let mut short_progress = None;
+        let short = take_crossfade(
+            &mut short_tail,
+            &mut short_progress,
+            vec![0.0; 2 * channels],
+            2,
+            true,
+        );
+        assert_eq!(short.len(), overlap * channels);
+        assert_eq!(&short[..2 * channels], &[1.0, 0.0, 1.0, 0.0]);
+        assert!(short_tail.is_empty());
+        assert!(short_progress.is_none());
         assert_eq!(whole.len(), overlap * channels);
         assert_eq!(whole_tail.len(), overlap * channels);
         assert_eq!(

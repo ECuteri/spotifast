@@ -202,6 +202,12 @@ The default local output smooths volume and mute changes over 30 ms. Explicit
 track changes and play/pause/stop use nominal 50 ms fades. Stopping can shorten
 the fade to the queued audio. Natural track transitions remain gapless.
 
+For a song-to-song overlap, enable **Crossfade** in **Settings → Playback on
+this computer** and choose 0–12 seconds. It works with every local audio
+backend. Turning the switch off keeps the chosen duration. Pause retains the
+held overlap; skip and seek discard it. The last song plays its tail in full.
+Crossfade enables a gapless handoff while it is active.
+
 Left and right arrows adjust a focused volume slider by five percentage
 points, or the seek slider by one percent of the song. Screen readers can
 also read and set these sliders' values. `Ctrl+F` (`Cmd+F` on macOS) focuses

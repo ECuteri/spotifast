@@ -306,6 +306,14 @@ Playback runs on a separate runtime. Librespot maintains the Spotify Connect
 session, exposes this computer as a device, receives transfers, and reports
 playback state. If the session drops, it reconnects with the stored credential.
 
+The sink consumes a dedicated librespot event channel synchronously before
+start, write and stop. UI state uses its own asynchronous channel. Crossfade
+therefore observes decoder track boundaries before audio packets, independent
+of UI scheduling. The overlap mixes post-EQ audio before limiting, volume and
+backend conversion, including PulseAudio. Pause keeps the overlap, explicit
+replacement and seek reset it, and natural completion drains the complete tail.
+The output drain deadline includes the queued audio duration at natural end.
+
 Since 0.9.0, selecting this computer in the device picker asks
 librespot to transfer playback from the active Connect device. Spotify supplies
 the current song, position, playing or paused state, context, and queue together.

@@ -27,6 +27,9 @@ Spotifast is a Spotify client written in Rust with
 **Playback needs Spotify Premium.** Free accounts can browse and search, but
 cannot play music through Spotifast.
 
+Local playback offers an optional **Crossfade** switch and a 0–12 second
+slider in Settings, on Linux, macOS, and Windows.
+
 ![Spotifast Home with the playlist library, recommendations, queue, and player visible](docs/screenshot.png)
 
 <details>

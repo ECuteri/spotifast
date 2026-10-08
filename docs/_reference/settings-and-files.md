@@ -223,9 +223,9 @@ main fields are:
 | `bitrate` | `320` | 96, 160, or 320 kbps |
 | `normalisation` | `false` | Volume normalisation |
 | `autoplay` | `true` | Keep playing similar music at the end |
-| `gapless` | `true` | Gapless playback |
+| `gapless` | `true` | Gapless playback. An active crossfade also enables the gapless handoff |
 | `crossfade` | `false` | Song-to-song crossfade switch. Off changes nothing. A file saved before the switch is on when `crossfade_secs` is above zero |
-| `crossfade_secs` | `0` | Crossfade length in seconds, from the Settings slider, 0 to 12. A larger saved value is treated as 12. The slider keeps its place while the switch is off, and that length is used again when the switch is turned on. Only that overlap is held, and only while the switch is on |
+| `crossfade_secs` | `0` | Crossfade length in seconds, from the Settings slider, 0 to 12. A larger saved value is treated as 12. The slider keeps its place while the switch is off, and that length is used again when the switch is turned on. Only that overlap is held, and only while the switch is on. Applies to every local backend |
 | `audio_backend` | platform | `pulseaudio` or `rodio` on Linux. `rodio` is Spotifast's own output, through ALSA; librespot's separate rodio backend is no longer built in, and a backend this build lacks plays through Spotifast's own output |
 | `audio_device` | none | Output device for music on this computer. Absent, or blank, follows the system's default. A name from **Settings → Playback → Output device** opens that device; one that is not connected falls back to the default. Changing it takes **Apply and restart playback** |
 | `audio_cache_mb` | `1024` | On-disk audio cache budget |
