@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spotifast playlist dialog comparison</title>
+<style>
+  body { margin: 24px auto; padding: 0 20px; max-width: 1280px; font: 16px/1.5 system-ui; color: #172027; background: #f5f6f8; }
+  h1 { font-size: 26px; margin-bottom: 8px; }
+  nav { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 20px 0; }
+  select, button { min-height: 44px; padding: 8px 14px; border: 1px solid #737c85; border-radius: 8px; font: inherit; background: white; color: inherit; }
+  button[aria-pressed="true"] { background: #172027; color: white; }
+  img { width: 100%; height: auto; border-radius: 8px; display: block; }
+  #failure { color: #a21d2f; }
+</style>
+<h1>Playlist dialogs shrink after a longer dialog</h1>
+<p>Open Keyboard shortcuts, close it, then open New playlist. These are captures of the native Linux ARM64 application in demo mode, using the same data, window size and sequence for both revisions.</p>
+<p>Baseline: <code>3d0b37b</code>. Candidate: <code id="commit">9ee49e8</code>. A temporary demo-only capture fixture queues the existing close/open actions on frames 4 and 6. It is removed from the published change. No Spotify playlist is created. macOS runtime remains unverified.</p>
+<nav aria-label="Comparison controls">
+  <label>Theme <select id="theme"><option value="dark">Dark</option><option value="light">Light</option></select></label>
+  <label>Window <select id="size"><option value="normal">Normal, 1280 × 800</option><option value="tall">Narrow and tall, 720 × 1600</option></select></label>
+  <button id="before" aria-pressed="false">Before</button>
+  <button id="after" aria-pressed="true">After</button>
+</nav>
+<p id="failure" role="alert" hidden>The selected capture could not be loaded.</p>
+<img id="capture" alt="Native Spotifast playlist creation dialog">
+<script>
+  let revision = 'after';
+  const theme = document.querySelector('#theme');
+  const size = document.querySelector('#size');
+  const capture = document.querySelector('#capture');
+  const remote = 'https://raw.githubusercontent.com/ECuteri/spotifast/codex/playlist-dialog-evidence/review/playlist-dialog/';
+  function update() {
+    const file = `${revision}-warmed-create-${theme.value}-${size.value}.png`;
+    capture.src = location.protocol === 'file:' ? remote + file : file;
+    capture.alt = `${revision === 'before' ? 'Before' : 'After'}: New playlist after Keyboard shortcuts, ${theme.value} theme, ${size.selectedOptions[0].textContent}`;
+    document.querySelector('#failure').hidden = true;
+    for (const name of ['before', 'after']) document.querySelector('#' + name).setAttribute('aria-pressed', String(name === revision));
+  }
+  theme.onchange = size.onchange = update;
+  for (const name of ['before', 'after']) document.querySelector('#' + name).onclick = () => { revision = name; update(); };
+  capture.onerror = () => document.querySelector('#failure').hidden = false;
+  update();
+</script>
+</html>

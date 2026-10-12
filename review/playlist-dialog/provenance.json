@@ -1,0 +1,43 @@
+{
+  "baseline": "3d0b37baffbf90863ce4c90a3488bbcf701a4edc",
+  "candidate": "9ee49e8576503be7c3516db05537d76f9868b9b9",
+  "platform": "Linux ARM64, native eframe/OpenGL, NVIDIA GB10",
+  "method": "Same isolated demo data. Open Shortcuts at startup, queue CloseDialog on frame 4 and ShowDialog(CreatePlaylist) on frame 6 using a temporary demo-only fixture in entrypoint.rs. Native demo-shot after 7000ms. Fixture removed from candidate source. No real Spotify playlist created.",
+  "limits": [
+    "Native macOS not run"
+  ],
+  "capture_viewports": {
+    "after-warmed-create-dark-normal.png": [
+      1280,
+      800
+    ],
+    "after-warmed-create-dark-tall.png": [
+      720,
+      1600
+    ],
+    "after-warmed-create-light-normal.png": [
+      1280,
+      800
+    ],
+    "after-warmed-create-light-tall.png": [
+      720,
+      1600
+    ],
+    "before-warmed-create-dark-normal.png": [
+      1280,
+      800
+    ],
+    "before-warmed-create-dark-tall.png": [
+      720,
+      1600
+    ],
+    "before-warmed-create-light-normal.png": [
+      1280,
+      800
+    ],
+    "before-warmed-create-light-tall.png": [
+      720,
+      1600
+    ]
+  }
+}
