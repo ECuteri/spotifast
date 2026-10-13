@@ -19453,6 +19453,38 @@ mod tests {
         ));
         app.playlist_pages.get_mut("pl1").unwrap().autoplay = loaded;
         draw(&mut app, Vec::new());
+        let click = |target_node| {
+            vec![egui::Event::AccessKitActionRequest(ActionRequest {
+                target_tree: TreeId::ROOT,
+                target_node,
+                action: AccessibleAction::Click,
+                data: None,
+            })]
+        };
+        for (offline, reachable) in [(true, true), (false, false), (true, false)] {
+            app.offline = offline;
+            app.network_reachable = reachable;
+            let tree = draw(&mut app, Vec::new()).0;
+            let (button, node) = tree
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("Add to playlist: Song new0"))
+                .expect("cached suggestions remain visible offline");
+            draw(&mut app, click(*button));
+            let page = &app.playlist_pages["pl1"];
+            assert!(
+                page.local_additions.is_empty(),
+                "offline={offline}, reachable={reachable}: Add must not edit the playlist"
+            );
+            assert_eq!(page.items.items.len(), 3);
+            assert!(
+                !app.playlist_busy,
+                "a dropped write must not leave Add busy"
+            );
+            assert!(node.is_disabled(), "Add is exposed as disabled offline");
+        }
+        app.offline = false;
+        app.network_reachable = true;
         let tree = draw(&mut app, Vec::new()).0;
         let buttons: Vec<_> = tree
             .nodes
@@ -19473,15 +19505,7 @@ mod tests {
             .unwrap()
             .0;
         let playing = app.current_track_uri();
-        draw(
-            &mut app,
-            vec![egui::Event::AccessKitActionRequest(ActionRequest {
-                target_tree: TreeId::ROOT,
-                target_node: button,
-                action: AccessibleAction::Click,
-                data: None,
-            })],
-        );
+        draw(&mut app, click(button));
         let page = &app.playlist_pages["pl1"];
         assert!(page.local_additions.contains("spotify:track:new0"));
         assert_eq!(

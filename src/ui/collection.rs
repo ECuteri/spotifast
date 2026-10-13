@@ -1815,7 +1815,7 @@ fn playlist_autoplay(
                         );
                     },
                 );
-                let enabled = app.network_reachable && !app.playlist_busy;
+                let enabled = !app.offline && app.network_reachable && !app.playlist_busy;
                 let response = ui
                     .add_enabled_ui(enabled, |ui| {
                         theme::soft_button(ui, &palette, None, &add, false)
