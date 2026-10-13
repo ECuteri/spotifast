@@ -368,6 +368,9 @@ the song is absent or the check fails, playback loads the saved song itself at
 its saved position. Radio contexts are freshly mixed, so they resume the song
 directly. Manually queued songs wait for this load. A new play request, device
 transfer, sign-out or engine replacement cancels an unfinished check.
+The resume stays on this computer: if another device takes over playback before
+the local engine is ready, that device keeps what it plays and the resume is
+dropped.
 
 Playback runs on a separate runtime. Librespot maintains the Spotify Connect
 session, exposes this computer as a device, receives transfers, and reports

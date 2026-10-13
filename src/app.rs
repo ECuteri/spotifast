@@ -7427,6 +7427,18 @@ impl App {
     /// in one ordered exchange: two independent requests race, and shuffle
     /// sometimes lost.
     fn play_request(&mut self, request: PlayRequest, shuffle_first: bool) {
+        // A cold-start resume continues this computer's last session. If
+        // another device took over while the engine started, it keeps what
+        // it plays: the Web API cannot check the saved context's offset.
+        if request.resume && matches!(self.target(), Target::Remote(Some(_))) {
+            self.queued_play = None;
+            self.queue_start_pending = None;
+            self.intent_track = None;
+            self.assumed_context = None;
+            self.optimistic_playing = None;
+            self.clear_play_pending();
+            return;
+        }
         // Shuffle applies across contexts until disabled. A selected row still
         // starts first; otherwise choose a random starting track.
         let mut request = request;
@@ -13897,6 +13909,33 @@ mod tests {
             request.position_ms, 19_566,
             "the song resumes where it stopped, not at zero"
         );
+    }
+
+    /// A cold-start resume never follows playback to another device: that
+    /// device keeps what it plays instead of the stale local context.
+    #[test]
+    fn a_cold_start_resume_stays_on_this_computer() {
+        let mut app = headless_app();
+        app.resume_context = Some("spotify:playlist:pl1".into());
+        app.resume_track = Some("spotify:track:abc".into());
+        app.resume_position_ms = 19_566;
+        app.toggle_play();
+        assert!(app.queued_play.is_some(), "held for the engine");
+
+        // The user picks a phone before the engine is ready.
+        app.selected_device = Some("phone".into());
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "demo-local".into(),
+        });
+        assert!(app.queued_play.is_none());
+        assert!(app.intent_track.is_none());
+        assert!(app.requested_track_preview().is_none());
+        assert_ne!(
+            app.playing_context_uri().as_deref(),
+            Some("spotify:playlist:pl1"),
+            "the phone is not shown playing the saved playlist"
+        );
+        app.backend.shutdown();
     }
 
     #[test]
