@@ -639,7 +639,9 @@ impl Settings {
     /// A file from before the switch has no `crossfade` field. Treat a saved
     /// length above zero as on, and zero as off.
     pub(crate) fn migrate_crossfade(&mut self, text: &str) {
-        if !text.contains("\"crossfade\"") {
+        if serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(text)
+            .is_ok_and(|fields| !fields.contains_key("crossfade"))
+        {
             self.crossfade = self.crossfade_secs > 0;
         }
     }
@@ -1265,19 +1267,29 @@ mod tests {
     /// The switch and the length then round-trip on their own.
     #[test]
     fn a_saved_crossfade_length_turns_the_switch_on() {
-        let mut off: Settings = serde_json::from_str(r#"{"crossfade_secs":0}"#).unwrap();
-        off.migrate_crossfade(r#"{"crossfade_secs":0}"#);
-        assert!(!off.crossfade);
-
-        let mut on: Settings = serde_json::from_str(r#"{"crossfade_secs":8}"#).unwrap();
-        on.migrate_crossfade(r#"{"crossfade_secs":8}"#);
-        assert!(on.crossfade);
-        assert_eq!(on.crossfade_secs, 8);
-
-        let kept: Settings =
-            serde_json::from_str(r#"{"crossfade":false,"crossfade_secs":8}"#).unwrap();
-        assert!(!kept.crossfade);
-        assert_eq!(kept.crossfade_secs, 8);
+        let root = std::env::temp_dir().join(format!(
+            "spotifast-crossfade-migration-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        for (text, enabled, seconds) in [
+            (r#"{"crossfade_secs":0}"#, false, 0),
+            (r#"{"crossfade_secs":8}"#, true, 8),
+            (
+                r#"{"crossfade_secs":8,"search_history":["crossfade"]}"#,
+                true,
+                8,
+            ),
+            (r#"{"crossfade":false,"crossfade_secs":8}"#, false, 8),
+            (r#"{"\u0063rossfade":false,"crossfade_secs":8}"#, false, 8),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let settings = Settings::load(&path);
+            assert_eq!(settings.crossfade, enabled, "{text}");
+            assert_eq!(settings.crossfade_secs, seconds, "{text}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

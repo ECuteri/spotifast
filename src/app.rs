@@ -9136,7 +9136,7 @@ impl App {
                 ctx.set_theme(self.theme_preference());
             }
             Action::UpdateCrossfade => {
-                self.save_settings();
+                self.mark_settings_dirty();
                 self.backend
                     .send(Command::UpdateCrossfade(std::time::Duration::from_secs(
                         u64::from(
@@ -21931,6 +21931,8 @@ mod tests {
         app.local.playback = Playback::Playing;
         app.settings.gapless = false;
         app.settings.crossfade_secs = 4;
+        app.save_settings();
+        let before = std::fs::read(app.dirs.settings_file()).unwrap();
         let ctx = egui::Context::default();
         crate::theme::install(&ctx);
         ctx.enable_accesskit();
@@ -21999,10 +22001,10 @@ mod tests {
                 .any(|a| matches!(a, Action::RestartEngine))
         );
         app.apply_actions(&ctx);
-        let saved = Settings::load(&app.dirs.settings_file());
-        assert!(saved.crossfade);
-        assert_eq!(saved.crossfade_secs, 4);
-        assert!(!saved.gapless);
+        assert!(
+            std::fs::read(app.dirs.settings_file()).unwrap() == before,
+            "slider changes wait for the delayed settings save"
+        );
         let output = frame(&mut app, &ctx, vec![]);
         let nodes = output.platform_output.accesskit_update.unwrap().nodes;
         let slider = nodes
@@ -22029,7 +22031,17 @@ mod tests {
                 .any(|a| matches!(a, Action::RestartEngine))
         );
         app.apply_actions(&ctx);
-        assert_eq!(Settings::load(&app.dirs.settings_file()).crossfade_secs, 12);
+        assert!(
+            std::fs::read(app.dirs.settings_file()).unwrap() == before,
+            "slider changes wait for the delayed settings save"
+        );
+        app.last_settings_save = Instant::now() - Duration::from_secs(3);
+        app.background_frame(&ctx);
+        assert!(!app.settings_dirty);
+        let saved = Settings::load(&app.dirs.settings_file());
+        assert!(saved.crossfade);
+        assert_eq!(saved.crossfade_secs, 12);
+        assert!(!saved.gapless);
         assert_eq!(app.local.playback, Playback::Playing);
         assert!(!app.toasts.iter().any(|t| t.message.contains("Restarting")));
         app.backend.shutdown();

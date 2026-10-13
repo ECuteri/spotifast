@@ -2815,6 +2815,7 @@ impl Worker {
                         }
                     });
                 }
+                engine.set_crossfade(self.engine_config.crossfade);
                 let device_id = engine.device_id().to_string();
                 let engine = Arc::new(engine);
                 self.heard = Some(engine.heard());
@@ -5213,6 +5214,7 @@ mod authorization_tests {
     #[test]
     fn live_crossfade_updates_keep_next_engine_config_and_gapless_preference() {
         let (runtime, mut worker, _) = worker("crossfade-config");
+        worker.engine_busy = true;
         worker.engine_config.gapless = false;
         let (commands, receiver) = mpsc::unbounded_channel();
         for seconds in [0, 4, 12] {
