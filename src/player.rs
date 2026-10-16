@@ -427,9 +427,10 @@ impl Engine {
                 // knows what to pick up.
                 *ended_interrupted.lock().unwrap_or_else(|p| p.into_inner()) =
                     current.interrupted();
-                current.connected = false;
-                current.playback = Playback::Stopped;
-                current.position_at = None;
+                session_ended(
+                    &mut current,
+                    ended_flag.load(std::sync::atomic::Ordering::SeqCst),
+                );
                 ended_notify(EngineEvent::State(current.clone()));
             }
             if !ended_flag.load(std::sync::atomic::Ordering::SeqCst) {
@@ -463,6 +464,16 @@ impl Engine {
                 .unwrap_or_else(|p| p.into_inner())
                 .interrupted()
         })
+    }
+
+    /// Where the song is now, while it is still playing.
+    pub fn playing_position(&self) -> Option<u32> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        (state.playback == Playback::Playing).then(|| state.position_now())
+    }
+
+    pub fn local_state(&self) -> LocalState {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub fn device_id(&self) -> &str {
@@ -796,6 +807,19 @@ async fn run_events(
         if let Some(snapshot) = snapshot {
             notify(EngineEvent::State(snapshot));
         }
+    }
+}
+
+/// The session is gone. librespot's player does not stop with it, so a
+/// song that was playing carries on from what it has fetched until the
+/// next session takes over (#787); anything else, and every shutdown we
+/// asked for, is stopped.
+fn session_ended(state: &mut LocalState, shutting_down: bool) {
+    state.connected = false;
+    if shutting_down || state.playback != Playback::Playing {
+        state.playback = Playback::Stopped;
+        state.loading = false;
+        state.position_at = None;
     }
 }
 
@@ -1314,6 +1338,40 @@ mod tests {
         );
         if cfg!(target_os = "linux") {
             assert!(librespot_backend(Some("pulseaudio")).is_some());
+        }
+    }
+
+    /// #787: a dropped session leaves the playing song playing, at its
+    /// position, until the next one takes over; a shutdown stops it.
+    #[test]
+    fn a_dropped_session_keeps_the_song_playing_and_a_shutdown_stops_it() {
+        let playing = LocalState {
+            connected: true,
+            playback: Playback::Playing,
+            position_ms: 61_000,
+            position_at: Some(Instant::now()),
+            ..LocalState::default()
+        };
+        let mut dropped = playing.clone();
+        session_ended(&mut dropped, false);
+        assert!(!dropped.connected);
+        assert_eq!(dropped.playback, Playback::Playing);
+        assert!(dropped.position_at.is_some(), "the position keeps moving");
+
+        let mut shut = playing.clone();
+        session_ended(&mut shut, true);
+        assert_eq!(shut.playback, Playback::Stopped);
+        assert_eq!(shut.position_at, None);
+
+        for playback in [Playback::Paused, Playback::Loading] {
+            let mut other = LocalState {
+                playback,
+                loading: true,
+                ..playing.clone()
+            };
+            session_ended(&mut other, false);
+            assert_eq!(other.playback, Playback::Stopped);
+            assert!(!other.loading);
         }
     }
 

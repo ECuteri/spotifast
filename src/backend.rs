@@ -1641,8 +1641,15 @@ struct Worker {
     /// What the engine was playing when it went down, to load again once
     /// the next one is up.
     resume: Option<PlaybackResume>,
-    /// A pickup in flight: the load to repeat and how often it was tried.
-    resume_verify: Option<(PlaybackResume, u8)>,
+    /// A pickup in flight: the load to repeat, how often it was tried, and
+    /// where the song had played out to on the dropped session.
+    resume_verify: Option<(PlaybackResume, u8, Option<u32>)>,
+    /// The engine whose session dropped, still playing out the song it had
+    /// while the next one connects (#787).
+    draining: Option<Arc<Engine>>,
+    /// The connection attempt whose engine's state the app is shown: the
+    /// draining one until the next has taken over.
+    shown_engine: Arc<std::sync::atomic::AtomicU64>,
     network_reachable: bool,
     waiting_for_network: bool,
     engine_attempt: u64,
@@ -1719,6 +1726,8 @@ impl Worker {
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
+            draining: None,
+            shown_engine: Arc::default(),
             network_reachable: true,
             waiting_for_network: false,
             engine_attempt: 0,
@@ -2012,6 +2021,19 @@ impl Worker {
                     self.change_proxy(request, config, false)
                 }
                 Command::Player(command) => {
+                    // The user changed what plays: the song playing out a
+                    // dropped session stops for it.
+                    if matches!(
+                        &command,
+                        PlayerCommand::Toggle
+                            | PlayerCommand::Next
+                            | PlayerCommand::Previous
+                            | PlayerCommand::Seek(_)
+                            | PlayerCommand::Load(_)
+                            | PlayerCommand::Transfer
+                    ) {
+                        self.retire_draining();
+                    }
                     if matches!(&command, PlayerCommand::Load(_)) {
                         self.resume = None;
                     }
@@ -2501,6 +2523,9 @@ impl Worker {
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
+        if let Some(engine) = self.draining.take() {
+            engine.shutdown();
+        }
         drop(cache_writes);
         let _ = cache_writer.await;
     }
@@ -2978,6 +3003,9 @@ impl Worker {
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
+        if let Some(engine) = self.draining.take() {
+            engine.shutdown();
+        }
         if let Some(cancel) = self.cancel_signin.take() {
             let _ = cancel.send(true);
         }
@@ -3004,17 +3032,21 @@ impl Worker {
         self.connect_engine(credentials);
     }
 
-    fn engine_notify(&self) -> crate::player::Notify {
+    fn engine_notify(&self, attempt: u64) -> crate::player::Notify {
         let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
         let lease = self.credentials.lease(CredentialSlot::Playback);
+        let shown = Arc::clone(&self.shown_engine);
         Arc::new(move |event| {
             if !lease.current() {
                 return;
             }
             match event {
                 EngineEvent::State(state) => {
+                    if shown.load(std::sync::atomic::Ordering::SeqCst) != attempt {
+                        return;
+                    }
                     let _ = events.send(Event::Local(Box::new(state)));
                     waker.wake();
                 }
@@ -3105,7 +3137,43 @@ impl Worker {
             "local playback session ended; reconnecting ({} of {RECONNECT_LIMIT} in ten minutes)",
             self.reconnects.len()
         );
-        self.replace_engine();
+        // librespot's player outlives its session: the song plays on from
+        // what it has fetched until the next session takes over, instead of
+        // stopping for the seconds a reconnect takes (#787).
+        let playing = self.engine.take();
+        self.take_engine_for_resume();
+        if let Some(engine) = playing {
+            self.resume = engine.resume_point();
+            self.draining = Some(engine);
+        }
+        self.resume_engine();
+    }
+
+    /// The new engine takes over from the draining one: what to restore
+    /// (as of now, not of the drop) and where the song has played out to.
+    /// The new engine is shown before the old one stops, so the app never
+    /// sees that stop.
+    fn hand_over(&mut self) -> Option<(Option<PlaybackResume>, Option<u32>)> {
+        let engine = self.draining.take()?;
+        let position = engine.playing_position();
+        let resume = engine.resume_point();
+        self.shown_engine
+            .store(self.engine_attempt, std::sync::atomic::Ordering::SeqCst);
+        engine.shutdown();
+        Some((resume, position))
+    }
+
+    /// Stops the draining engine without a successor taking over, keeping
+    /// what it played for the next one to pick up. It stays shown, so its
+    /// stop reaches the app; the next engine is shown once it connects.
+    fn retire_draining(&mut self) {
+        let Some(engine) = self.draining.take() else {
+            return;
+        };
+        if let Some(resume) = engine.resume_point() {
+            self.resume = Some(resume);
+        }
+        engine.shutdown();
     }
 
     /// Try the saved grant again after a backoff. Each failure in a row
@@ -3164,6 +3232,7 @@ impl Worker {
     /// comes back at the level it was heard at, not at the level the app
     /// launched with.
     fn take_engine_for_resume(&mut self) {
+        self.retire_draining();
         self.resume_verify = None;
         self.album_type_lookup.requeue_active_for_new_engine();
         self.playlist_header_lookup.requeue_active_for_new_engine();
@@ -3315,6 +3384,10 @@ impl Worker {
         self.engine_busy = true;
         self.engine_attempt = self.engine_attempt.wrapping_add(1);
         let attempt = self.engine_attempt;
+        if self.draining.is_none() {
+            self.shown_engine
+                .store(attempt, std::sync::atomic::Ordering::SeqCst);
+        }
         if !self.engine_retry_quiet {
             self.emit(Event::Playback(LocalPlayback::Connecting));
         }
@@ -3322,7 +3395,7 @@ impl Worker {
         let config = self.engine_config.clone();
         let proxy = config.proxy.librespot_url();
         self.engine_proxy = proxy.clone();
-        let notify = self.engine_notify();
+        let notify = self.engine_notify(attempt);
         let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
@@ -3438,12 +3511,26 @@ impl Worker {
                 let device_id = engine.device_id().to_string();
                 let engine = Arc::new(engine);
                 self.heard = Some(engine.heard());
-                if let Some(spec) = self.resume.take() {
+                let handed_over = if let Some(spec) = self.resume.take() {
                     // Delay resume until Spirc finishes registering. An early
                     // load can return 400 and leave playback stopped. Verify
-                    // the load and retry if needed.
-                    self.resume_verify = Some((spec, 0));
+                    // the load and retry if needed. A draining engine plays
+                    // on until then.
+                    self.resume_verify = Some((spec, 0, None));
                     self.schedule_resume_check(1_500);
+                    false
+                } else {
+                    self.hand_over().is_some()
+                };
+                if self.draining.is_none()
+                    && (handed_over
+                        || self
+                            .shown_engine
+                            .swap(attempt, std::sync::atomic::Ordering::SeqCst)
+                            != attempt)
+                {
+                    // Its first state went by while another engine was shown.
+                    self.emit(Event::Local(Box::new(engine.local_state())));
                 }
                 self.engine = Some(engine);
                 self.start_rootlist();
@@ -3456,6 +3543,7 @@ impl Worker {
                 self.start_prerelease();
             }
             None => {
+                self.retire_draining();
                 if !self.network_reachable {
                     self.waiting_for_network = true;
                     self.emit(Event::Playback(LocalPlayback::WaitingForNetwork));
@@ -3512,6 +3600,9 @@ impl Worker {
             self.playlist_header_lookup.clear_engine_work();
             self.carry_volume();
             if let Some(engine) = self.engine.take() {
+                engine.shutdown();
+            }
+            if let Some(engine) = self.draining.take() {
                 engine.shutdown();
             }
             self.pending_playback_grant = None;
@@ -3647,12 +3738,18 @@ impl Worker {
     /// Verifies playback after reconnect and retries loads rejected while
     /// Spirc is still registering. Runs on the backend timer.
     fn verify_resume(&mut self) {
-        let Some((spec, attempts)) = self.resume_verify.take() else {
+        let Some((mut spec, attempts, mut position)) = self.resume_verify.take() else {
             return;
         };
-        let Some(engine) = &self.engine else {
+        let Some(engine) = self.engine.clone() else {
             return;
         };
+        if let Some((resume, played_to)) = self.hand_over() {
+            spec = resume.unwrap_or(spec);
+            position = played_to;
+            // Its first state went by while the draining engine was shown.
+            self.emit(Event::Local(Box::new(engine.local_state())));
+        }
         if engine.interrupted().is_some() {
             // Playback resumed or another track started.
             return;
@@ -3668,7 +3765,14 @@ impl Worker {
         if let Err(error) = engine.resume(spec.clone()) {
             log::warn!("unable to pick playback up again: {error}");
         }
-        self.resume_verify = Some((spec, attempts + 1));
+        // The restore loads where the session dropped; a seek while it loads
+        // starts it where the draining engine had got to instead.
+        if let Some(position) = position
+            && let Err(error) = engine.command(PlayerCommand::Seek(position))
+        {
+            log::warn!("unable to continue from {position} ms: {error}");
+        }
+        self.resume_verify = Some((spec, attempts + 1, position));
         self.schedule_resume_check(4_000);
     }
 
@@ -7187,6 +7291,42 @@ mod authorization_tests {
             Waker::default(),
         );
         (runtime, worker, events)
+    }
+
+    /// #787: while the dropped session's engine plays out its song, the
+    /// connecting engine's idle state must not reach the app, and after the
+    /// handover the old engine's stop must not either.
+    #[test]
+    fn only_the_shown_engine_reaches_the_app() {
+        let (_runtime, worker, events) = worker("shown-engine");
+        let draining = worker.engine_notify(1);
+        let connecting = worker.engine_notify(2);
+        let playing = LocalState {
+            playback: crate::player::Playback::Playing,
+            ..LocalState::default()
+        };
+        let shown = |events: &std::sync::mpsc::Receiver<Event>| -> Vec<crate::player::Playback> {
+            events
+                .try_iter()
+                .filter_map(|event| match event {
+                    Event::Local(state) => Some(state.playback),
+                    _ => None,
+                })
+                .collect()
+        };
+        worker
+            .shown_engine
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        draining(EngineEvent::State(playing.clone()));
+        connecting(EngineEvent::State(LocalState::default()));
+        assert_eq!(shown(&events), [crate::player::Playback::Playing]);
+
+        worker
+            .shown_engine
+            .store(2, std::sync::atomic::Ordering::SeqCst);
+        draining(EngineEvent::State(LocalState::default()));
+        connecting(EngineEvent::State(playing));
+        assert_eq!(shown(&events), [crate::player::Playback::Playing]);
     }
 
     #[test]

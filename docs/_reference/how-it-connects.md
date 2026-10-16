@@ -147,10 +147,16 @@ contexts and queue in memory. The replacement session restores them after
 Connect registration instead of loading only the interrupted song. Unresolved
 context pages continue through the new session. The snapshot contains no login
 credentials, is never written to disk, and cannot be restored by another
-account. Reconnecting can still briefly interrupt audio, and the replacement
-engine starts at the volume being heard. This recovery applies to unexpected
-disconnects; changing audio settings still restarts the engine with its
-current-track pickup.
+account. The replacement engine starts at the volume being heard. This
+recovery applies to unexpected disconnects; changing audio settings still
+restarts the engine with its current-track pickup.
+
+A song that was playing when the session dropped keeps playing from the audio
+already fetched while the replacement session connects. The new session then
+picks it up at the point it has reached, so the reconnect costs only the
+moment the new session takes to load the song, instead of the whole reconnect.
+Play or pause, skipping, seeking, choosing something else or changing audio
+settings during the reconnect stops the old playback right away.
 
 ## What the client stores
 
