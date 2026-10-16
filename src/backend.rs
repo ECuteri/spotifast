@@ -2021,21 +2021,27 @@ impl Worker {
                     self.change_proxy(request, config, false)
                 }
                 Command::Player(command) => {
-                    // The user changed what plays: the song playing out a
-                    // dropped session stops for it.
-                    if matches!(
-                        &command,
+                    match &command {
+                        // A pause while a dropped session's song plays out
+                        // stays a pause: nothing picks the song up again.
                         PlayerCommand::Toggle
-                            | PlayerCommand::Next
-                            | PlayerCommand::Previous
-                            | PlayerCommand::Seek(_)
-                            | PlayerCommand::Load(_)
-                            | PlayerCommand::Transfer
-                    ) {
-                        self.retire_draining();
-                    }
-                    if matches!(&command, PlayerCommand::Load(_)) {
-                        self.resume = None;
+                            if self
+                                .draining
+                                .as_ref()
+                                .is_some_and(|engine| engine.playing_position().is_some()) =>
+                        {
+                            self.retire_draining();
+                            self.resume = None;
+                            self.resume_verify = None;
+                        }
+                        // Something else chosen replaces whatever was to be
+                        // picked up.
+                        PlayerCommand::Load(_) => {
+                            self.retire_draining();
+                            self.resume = None;
+                            self.resume_verify = None;
+                        }
+                        _ => {}
                     }
                     match &self.engine {
                         Some(engine) => {
@@ -3098,6 +3104,8 @@ impl Worker {
         if !self.signed_in {
             return;
         }
+        // New settings take effect now, not after a deferred reconnect.
+        self.retire_draining();
         if defer_engine_replace(self.engine_busy, &mut self.engine_restart_pending) {
             return;
         }
@@ -3140,10 +3148,23 @@ impl Worker {
         // librespot's player outlives its session: the song plays on from
         // what it has fetched until the next session takes over, instead of
         // stopping for the seconds a reconnect takes (#787).
-        let playing = self.engine.take();
+        // A second drop before the handover keeps whichever engine is still
+        // playing, and its pickup; an idle replacement has none to give.
+        let dropped = self.engine.take();
+        let draining = self.draining.take();
         self.take_engine_for_resume();
-        if let Some(engine) = playing {
-            self.resume = engine.resume_point();
+        let (keep, idle) = match (dropped, draining) {
+            (Some(dropped), old) if dropped.playing_position().is_some() => (Some(dropped), old),
+            (dropped, Some(old)) => (Some(old), dropped),
+            (dropped, None) => (dropped, None),
+        };
+        if let Some(engine) = idle {
+            engine.shutdown();
+        }
+        if let Some(engine) = keep {
+            if let Some(resume) = engine.resume_point() {
+                self.resume = Some(resume);
+            }
             self.draining = Some(engine);
         }
         self.resume_engine();
