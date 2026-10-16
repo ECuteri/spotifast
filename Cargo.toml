@@ -180,6 +180,8 @@ aes = "0.8"
 ctr = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# pthread_set_qos_class_self_np raises the audio decoder thread (src/sink.rs).
+libc = "0.2"
 # The packaged Dock artwork also identifies unbundled Cargo runs.
 fastframe-dock = { git = "https://github.com/crmne/fastframe", rev = "3339a8bc524a51c47f87ca78c368dde3569d90f5" }
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }

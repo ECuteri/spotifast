@@ -838,10 +838,12 @@ impl Sink for RodioSink {
     }
 }
 
-/// Raises the Windows decoder thread one step above normal to prevent queued
-/// audio from running out under load (#88).
+/// Raises the decoder thread so the queued audio does not run out under
+/// load: one step above normal on Windows (#88), the user-interactive class
+/// on macOS, which otherwise lowers an app behind other windows until the
+/// sound drops out for a second or two (#787).
 ///
-/// Linux requires rtkit; CoreAudio owns its real-time callback on macOS.
+/// Linux requires rtkit.
 #[cfg(windows)]
 fn take_precedence() {
     use windows_sys::Win32::System::Threading::{
@@ -854,7 +856,18 @@ fn take_precedence() {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+fn take_precedence() {
+    // SAFETY: sets the calling thread's own class and takes nothing else.
+    let result = unsafe {
+        libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE, 0)
+    };
+    if result != 0 {
+        log::warn!("could not raise the audio decoder thread: error {result}");
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn take_precedence() {}
 
 #[derive(Debug, thiserror::Error)]
@@ -1085,6 +1098,28 @@ mod tests {
             Some(48_000)
         );
         drop(mixer);
+    }
+
+    /// #787: the decoder thread keeps its class behind other windows.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_decoder_thread_runs_as_user_interactive_on_macos() {
+        std::thread::spawn(|| {
+            take_precedence();
+            let mut class = libc::qos_class_t::QOS_CLASS_UNSPECIFIED;
+            let mut priority = 0;
+            // SAFETY: reads the calling thread's own class into locals.
+            let result = unsafe {
+                libc::pthread_get_qos_class_np(libc::pthread_self(), &mut class, &mut priority)
+            };
+            assert_eq!(result, 0);
+            assert_eq!(
+                class as u32,
+                libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE as u32
+            );
+        })
+        .join()
+        .unwrap();
     }
 
     /// A machine without audio (CI, a PC with nothing plugged in) must get
