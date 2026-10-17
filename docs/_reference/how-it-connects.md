@@ -155,8 +155,9 @@ A song that was playing when the session dropped keeps playing from the audio
 already fetched while the replacement session connects. The new session then
 picks it up at the point it has reached, so the reconnect costs only the
 moment the new session takes to load the song, instead of the whole reconnect.
-Pausing, choosing something else or changing audio settings during the
-reconnect stops the old playback right away, and a pause stays paused.
+Pausing during the reconnect pauses that song where it is, and the new
+session picks it up still paused. Choosing something else or changing audio
+settings during the reconnect stops the old playback right away.
 
 ## What the client stores
 

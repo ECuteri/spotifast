@@ -472,6 +472,23 @@ impl Engine {
         (state.playback == Playback::Playing).then(|| state.position_now())
     }
 
+    /// Pauses or plays the song a dropped session left playing. Spirc went
+    /// with the session, so this goes to the player itself; false when
+    /// there is no such song.
+    pub fn toggle_player(&self) -> bool {
+        match self.local_state().playback {
+            Playback::Playing => self.player.pause(),
+            Playback::Paused => self.player.play(),
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn pause(&self) -> Result<()> {
+        self.spirc.pause()?;
+        Ok(())
+    }
+
     pub fn local_state(&self) -> LocalState {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
