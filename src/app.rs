@@ -8632,6 +8632,7 @@ impl App {
             Target::Local => {
                 self.local.repeat = mode;
                 self.repeat_wanted = mode;
+                self.session_dirty = true;
                 self.backend.player(PlayerCommand::Repeat(mode));
             }
             Target::Remote(device_id) => {
@@ -14868,7 +14869,8 @@ mod tests {
         assert_eq!(request.offset_uri.as_deref(), Some("spotify:track:three"));
     }
 
-    /// A restored session keeps shuffle enabled when skipping.
+    /// A restored repeat mode drives local playback until the engine has a
+    /// song of its own.
     #[test]
     fn repeat_survives_a_restart_until_the_engine_has_a_song() {
         let mut app = headless_app();
@@ -14887,6 +14889,7 @@ mod tests {
         );
     }
 
+    /// A restored session keeps shuffle enabled when skipping.
     #[test]
     fn skipping_a_restored_song_keeps_shuffle_on() {
         use crate::api::models::{PlayableItem, PlaylistItem, Track};
